@@ -65,19 +65,17 @@ CODEGRAPH_DEPCRUISE_FILE_LIMIT=1500
 
 ## Commands
 
-```bash
-codegraph doctor
-codegraph reset
-codegraph discover --repo .
-codegraph index --ripple my-app --repo . --language typescript
-codegraph update --ripple my-app
-codegraph status --ripple my-app
-codegraph ripples
-codegraph visualize --ripple my-app --output codegraph-visualization.html
-codegraph serve --addr :8080
-codegraph test-extractor typescript
-codegraph mcp --ripple my-app
-```
+- `codegraph doctor`: checks Neo4j connection and local extractor config.
+- `codegraph reset`: deletes all graph data and ripples from Neo4j.
+- `codegraph discover --repo .`: detects package manager, workspaces, and project types.
+- `codegraph index --ripple my-app --repo . --language typescript`: creates or replaces a named ripple index for a repo.
+- `codegraph update --ripple my-app`: re-indexes an existing ripple using its saved repo and language.
+- `codegraph status --ripple my-app`: shows node and relationship counts for one ripple.
+- `codegraph ripples`: lists all indexed ripples in the database.
+- `codegraph visualize --ripple my-app --output graph.html`: exports an HTML graph viewer for one ripple.
+- `codegraph serve --addr :8080`: starts the HTTP MCP server with `/mcp/{ripple}` endpoints.
+- `codegraph mcp --ripple my-app`: starts the stdio MCP server for one ripple.
+- `codegraph test-extractor typescript`: validates the TypeScript extractor on the fixture repo.
 
 ## Ripples
 
