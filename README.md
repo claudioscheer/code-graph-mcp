@@ -149,6 +149,7 @@ The visualization plots every indexed node for one ripple on a canvas, groups no
 
 ## MCP Tools
 
+- `search_code`: broad search across files, symbols, packages, routes, tests, and config nodes.
 - `find_symbol`
 - `find_file`
 - `get_dependencies`

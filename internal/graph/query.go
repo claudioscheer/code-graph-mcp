@@ -20,6 +20,27 @@ type Options struct {
 	Direction     string
 }
 
+func (s Service) Search(ctx context.Context, query string, opts Options) (map[string]any, error) {
+	opts = normalize(opts)
+	return queryNodes(ctx, s.Driver, `
+		MATCH (n:GraphNode)
+		WHERE n.ripple = $ripple
+			AND (
+				toLower(coalesce(n.id, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.sourceId, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.name, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.path, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.filePath, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.kind, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.packageId, "")) CONTAINS toLower($query)
+				OR toLower(coalesce(n.primaryLabel, "")) CONTAINS toLower($query)
+			)
+		RETURN n AS node
+		ORDER BY n.primaryLabel, coalesce(n.path, n.filePath, n.name, n.id), n.id
+		LIMIT $limit
+	`, map[string]any{"query": query, "ripple": s.Ripple, "limit": opts.Limit + 1}, opts.Limit)
+}
+
 func (s Service) FindSymbol(ctx context.Context, name string, opts Options) (map[string]any, error) {
 	opts = normalize(opts)
 	return queryNodes(ctx, s.Driver, `
