@@ -185,6 +185,7 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		fmt.Fprintf(os.Stderr, "CodeGraph MCP running for ripple %q (%s)\n", *ripple, info.Repo)
 		return mcp.Server{Query: graph.Service{Driver: store.Driver(), Ripple: *ripple}, Repo: info.Repo}.Serve(ctx, os.Stdin, os.Stdout)
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -254,7 +255,7 @@ func serveHTTP(ctx context.Context, cfg config.Config, addr string) error {
 		<-ctx.Done()
 		_ = server.Shutdown(context.Background())
 	}()
-	fmt.Fprintf(os.Stderr, "listening on %s\n", addr)
+	fmt.Fprintf(os.Stderr, "CodeGraph HTTP MCP server running on %s with endpoints /mcp/{ripple}\n", addr)
 	return server.ListenAndServe()
 }
 
