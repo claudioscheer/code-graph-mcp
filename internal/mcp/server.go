@@ -39,24 +39,30 @@ func (s Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) e
 		if line == "" {
 			continue
 		}
-		var req request
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			_ = encoder.Encode(errorResponse(nil, -32700, err.Error()))
+		response, ok := s.Process(ctx, []byte(line))
+		if !ok {
 			continue
 		}
-		if req.ID == nil && strings.HasPrefix(req.Method, "notifications/") {
-			continue
-		}
-		result, err := s.handle(ctx, req)
-		if err != nil {
-			_ = encoder.Encode(errorResponse(req.ID, -32603, err.Error()))
-			continue
-		}
-		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}); err != nil {
+		if err := encoder.Encode(response); err != nil {
 			return err
 		}
 	}
 	return scanner.Err()
+}
+
+func (s Server) Process(ctx context.Context, payload []byte) (map[string]any, bool) {
+	var req request
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return errorResponse(nil, -32700, err.Error()), true
+	}
+	if req.ID == nil && strings.HasPrefix(req.Method, "notifications/") {
+		return nil, false
+	}
+	result, err := s.handle(ctx, req)
+	if err != nil {
+		return errorResponse(req.ID, -32603, err.Error()), true
+	}
+	return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}, true
 }
 
 func (s Server) handle(ctx context.Context, req request) (any, error) {
@@ -108,7 +114,11 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 	case "open_file_excerpt":
 		result, err = s.openFile(stringArg(args, "path"), intArg(args, "startLine", 1), intArg(args, "endLine", 80))
 	case "open_symbol_body":
-		file, _, ok := strings.Cut(strings.TrimPrefix(stringArg(args, "symbolId"), "symbol:"), "#")
+		symbolID := stringArg(args, "symbolId")
+		if s.Query.Ripple != "" {
+			symbolID = strings.TrimPrefix(symbolID, s.Query.Ripple+":")
+		}
+		file, _, ok := strings.Cut(strings.TrimPrefix(symbolID, "symbol:"), "#")
 		if !ok {
 			return nil, fmt.Errorf("symbolId must be symbol:<path>#<name>")
 		}

@@ -3,12 +3,14 @@ package graph
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
 type Service struct {
 	Driver neo4j.DriverWithContext
+	Ripple string
 }
 
 type Options struct {
@@ -22,22 +24,22 @@ func (s Service) FindSymbol(ctx context.Context, name string, opts Options) (map
 	opts = normalize(opts)
 	return queryNodes(ctx, s.Driver, `
 		MATCH (n:GraphNode:Symbol)
-		WHERE toLower(coalesce(n.name, "")) CONTAINS toLower($name)
+		WHERE n.ripple = $ripple AND toLower(coalesce(n.name, "")) CONTAINS toLower($name)
 		RETURN n AS node
 		ORDER BY n.name, n.id
 		LIMIT $limit
-	`, map[string]any{"name": name, "limit": opts.Limit + 1}, opts.Limit)
+	`, map[string]any{"name": name, "ripple": s.Ripple, "limit": opts.Limit + 1}, opts.Limit)
 }
 
 func (s Service) FindFile(ctx context.Context, path string, opts Options) (map[string]any, error) {
 	opts = normalize(opts)
 	return queryNodes(ctx, s.Driver, `
 		MATCH (n:GraphNode:File)
-		WHERE toLower(coalesce(n.path, n.id)) CONTAINS toLower($path)
+		WHERE n.ripple = $ripple AND toLower(coalesce(n.path, n.id)) CONTAINS toLower($path)
 		RETURN n AS node
 		ORDER BY n.path, n.id
 		LIMIT $limit
-	`, map[string]any{"path": path, "limit": opts.Limit + 1}, opts.Limit)
+	`, map[string]any{"path": path, "ripple": s.Ripple, "limit": opts.Limit + 1}, opts.Limit)
 }
 
 func (s Service) Relations(ctx context.Context, targetID string, opts Options) (map[string]any, error) {
@@ -50,29 +52,38 @@ func (s Service) Relations(ctx context.Context, targetID string, opts Options) (
 		pattern = `(start)<-[r*1..%d]-(n)`
 	}
 	query := fmt.Sprintf(`
-		MATCH (start:GraphNode {id: $id})
+		MATCH (start:GraphNode {id: $id, ripple: $ripple})
 		MATCH path = %s
-		WHERE all(rel IN relationships(path) WHERE coalesce(rel.confidence, 1.0) >= $minConfidence)
+		WHERE all(node IN nodes(path) WHERE node.ripple = $ripple)
+			AND all(rel IN relationships(path) WHERE rel.ripple = $ripple AND coalesce(rel.confidence, 1.0) >= $minConfidence)
 		RETURN nodes(path) AS nodes, relationships(path) AS relationships
 		LIMIT $limit
 	`, fmt.Sprintf(pattern, opts.Depth))
 	return queryPathsAsSlice(ctx, s.Driver, query, map[string]any{
-		"id": targetID, "limit": opts.Limit + 1, "minConfidence": opts.MinConfidence,
+		"id": s.scopedID(targetID), "ripple": s.Ripple, "limit": opts.Limit + 1, "minConfidence": opts.MinConfidence,
 	}, opts.Limit)
 }
 
 func (s Service) Paths(ctx context.Context, fromID string, toID string, opts Options) (map[string]any, error) {
 	opts = normalize(opts)
 	query := fmt.Sprintf(`
-		MATCH (from:GraphNode {id: $from}), (to:GraphNode {id: $to})
+		MATCH (from:GraphNode {id: $from, ripple: $ripple}), (to:GraphNode {id: $to, ripple: $ripple})
 		MATCH path = shortestPath((from)-[*1..%d]-(to))
-		WHERE all(rel IN relationships(path) WHERE coalesce(rel.confidence, 1.0) >= $minConfidence)
+		WHERE all(node IN nodes(path) WHERE node.ripple = $ripple)
+			AND all(rel IN relationships(path) WHERE rel.ripple = $ripple AND coalesce(rel.confidence, 1.0) >= $minConfidence)
 		RETURN nodes(path) AS nodes, relationships(path) AS relationships
 		LIMIT $limit
 	`, opts.Depth)
 	return queryPathResults(ctx, s.Driver, query, map[string]any{
-		"from": fromID, "to": toID, "limit": opts.Limit + 1, "minConfidence": opts.MinConfidence,
+		"from": s.scopedID(fromID), "to": s.scopedID(toID), "ripple": s.Ripple, "limit": opts.Limit + 1, "minConfidence": opts.MinConfidence,
 	}, opts.Limit)
+}
+
+func (s Service) scopedID(id string) string {
+	if s.Ripple == "" || strings.HasPrefix(id, s.Ripple+":") {
+		return id
+	}
+	return s.Ripple + ":" + id
 }
 
 func normalize(opts Options) Options {

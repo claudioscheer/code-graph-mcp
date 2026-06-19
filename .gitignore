@@ -7,4 +7,4 @@ node_modules/
 extractors/typescript/dist/
 coverage/
 .next/
-codegraph-visualization.html
+*-visualization.html

@@ -15,6 +15,7 @@ import (
 
 type Exporter struct {
 	Driver neo4j.DriverWithContext
+	Ripple string
 }
 
 type graphData struct {
@@ -65,17 +66,19 @@ func (e Exporter) WriteHTML(ctx context.Context, output string) error {
 func (e Exporter) load(ctx context.Context) (graphData, error) {
 	nodeResult, err := neo4j.ExecuteQuery(ctx, e.Driver, `
 		MATCH (n:GraphNode)
+		WHERE n.ripple = $ripple
 		RETURN n AS node
 		ORDER BY n.primaryLabel, n.id
-	`, nil, neo4j.EagerResultTransformer)
+	`, map[string]any{"ripple": e.Ripple}, neo4j.EagerResultTransformer)
 	if err != nil {
 		return graphData{}, err
 	}
 	edgeResult, err := neo4j.ExecuteQuery(ctx, e.Driver, `
 		MATCH (from:GraphNode)-[r]->(to:GraphNode)
+		WHERE r.ripple = $ripple
 		RETURN from.id AS from, to.id AS to, type(r) AS type, properties(r) AS props
 		ORDER BY type(r), from.id, to.id
-	`, nil, neo4j.EagerResultTransformer)
+	`, map[string]any{"ripple": e.Ripple}, neo4j.EagerResultTransformer)
 	if err != nil {
 		return graphData{}, err
 	}
