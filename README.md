@@ -101,6 +101,42 @@ The stdio MCP command is equivalent:
 codegraph mcp --ripple my-app
 ```
 
+## OpenCode Installation
+
+OpenCode supports local MCP servers in `opencode.json` under the `mcp` key. Add one server per ripple you want OpenCode to use.
+
+Example global config at `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "codegraph_my_app": {
+      "type": "local",
+      "command": [
+        "go",
+        "run",
+        "./cmd/codegraph",
+        "mcp",
+        "--ripple",
+        "my-app"
+      ],
+      "cwd": "/path/to/code-graph-mcp",
+      "enabled": true,
+      "timeout": 15000
+    }
+  }
+}
+```
+
+Then verify OpenCode can connect:
+
+```bash
+opencode mcp list
+```
+
+OpenCode should show the server as connected. In prompts, refer to the configured MCP name, for example `use codegraph_my_app to find the files related to auth`.
+
 ## Visualization
 
 Generate a self-contained HTML visualization from the current Neo4j graph:
