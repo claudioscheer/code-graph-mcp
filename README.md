@@ -103,7 +103,13 @@ codegraph mcp --ripple my-app
 
 ## OpenCode Installation
 
-OpenCode supports local MCP servers in `opencode.json` under the `mcp` key. Add one server per ripple you want OpenCode to use.
+OpenCode should connect to an already running CodeGraph HTTP MCP server. Start the server first:
+
+```bash
+go run ./cmd/codegraph serve --addr :8080
+```
+
+Then add one remote MCP server per ripple you want OpenCode to use.
 
 Example global config at `~/.config/opencode/opencode.json`:
 
@@ -112,16 +118,8 @@ Example global config at `~/.config/opencode/opencode.json`:
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "codegraph_my_app": {
-      "type": "local",
-      "command": [
-        "go",
-        "run",
-        "./cmd/codegraph",
-        "mcp",
-        "--ripple",
-        "my-app"
-      ],
-      "cwd": "/path/to/code-graph-mcp",
+      "type": "remote",
+      "url": "http://localhost:8080/mcp/my-app",
       "enabled": true,
       "timeout": 15000
     }
