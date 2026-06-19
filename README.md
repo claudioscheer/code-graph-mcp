@@ -133,7 +133,7 @@ Then verify OpenCode can connect:
 opencode mcp list
 ```
 
-OpenCode should show the server as connected. In prompts, refer to the configured MCP name and ask it to start with `codegraph_help`, for example `use codegraph_my_app, call codegraph_help first, then find the files related to auth`.
+OpenCode should show the server as connected. In prompts, refer to the configured MCP name and ask it to start with `codegraph_help`, for example `use codegraph_my_app, call codegraph_help first, then find the files related to billing`.
 
 ## Visualization
 
@@ -149,7 +149,14 @@ The visualization plots every indexed node for one ripple on a canvas, groups no
 
 - `codegraph_help`: explains how to use this MCP, including workflows, aliases, and examples.
 - `get_ripple_info`: returns the current ripple, repo path, language, and graph counts.
+- `get_index_freshness`: returns ripple metadata plus local repo branch and HEAD when available.
 - `list_node_types`: returns node label counts and relationship type counts for the current ripple.
+- `count_literal_files`: counts unique files containing an exact string and returns only paths plus category counts.
+- `find_env_usages`: finds actual runtime `process.env.NAME` read sites and returns files plus read counts.
+- `analyze_rename_impact`: one-call rename impact analysis for env vars and other exact names, with categorized file lists and compact graph relationship summaries.
+- `analyze_function_impact`: one-call blast-radius analysis for functions, hooks, components, methods, or exported symbol names.
+- `analyze_callsite_contract`: one-call analysis for feature work that requires every existing call to one function to be preceded by another check.
+- `prepare_feature_context`: one-call starter context pack for feature work, including entry points, likely edit files, tests, dependency summaries, and bounded blast radius.
 - `search_code`: broad search across files, symbols, packages, routes, tests, and config nodes.
 - `find_symbol`
 - `find_file`

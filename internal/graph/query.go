@@ -154,6 +154,54 @@ func (s Service) Paths(ctx context.Context, fromID string, toID string, opts Opt
 	}, opts.Limit)
 }
 
+func (s Service) FileRelationSummary(ctx context.Context, paths []string, limit int) (map[string]any, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if len(paths) == 0 {
+		return map[string]any{"files": []map[string]any{}}, nil
+	}
+	sourceIDs := make([]string, 0, len(paths))
+	for _, path := range paths {
+		sourceIDs = append(sourceIDs, "file:"+path)
+	}
+	result, err := neo4j.ExecuteQuery(ctx, s.Driver, `
+		MATCH (f:GraphNode:File {ripple: $ripple})
+		WHERE f.sourceId IN $sourceIDs OR f.path IN $paths
+		CALL {
+			WITH f
+			OPTIONAL MATCH (incoming:GraphNode)-[r]->(f)
+			WHERE incoming.ripple = $ripple AND r.ripple = $ripple
+			RETURN count(DISTINCT incoming) AS inboundCount,
+				collect(DISTINCT coalesce(incoming.path, incoming.filePath, incoming.name, incoming.sourceId))[0..$limit] AS inboundExamples
+		}
+		CALL {
+			WITH f
+			OPTIONAL MATCH (f)-[r]->(outgoing:GraphNode)
+			WHERE outgoing.ripple = $ripple AND r.ripple = $ripple
+			RETURN count(DISTINCT outgoing) AS outboundCount,
+				collect(DISTINCT coalesce(outgoing.path, outgoing.filePath, outgoing.name, outgoing.sourceId))[0..$limit] AS outboundExamples
+		}
+		RETURN f.path AS path, inboundCount, inboundExamples, outboundCount, outboundExamples
+		ORDER BY f.path
+	`, map[string]any{"ripple": s.Ripple, "paths": paths, "sourceIDs": sourceIDs, "limit": limit}, neo4j.EagerResultTransformer)
+	if err != nil {
+		return nil, err
+	}
+	files := []map[string]any{}
+	for _, record := range result.Records {
+		values := record.AsMap()
+		files = append(files, map[string]any{
+			"path":             values["path"],
+			"inboundCount":     values["inboundCount"],
+			"inboundExamples":  values["inboundExamples"],
+			"outboundCount":    values["outboundCount"],
+			"outboundExamples": values["outboundExamples"],
+		})
+	}
+	return map[string]any{"files": files, "returned": len(files)}, nil
+}
+
 func (s Service) scopedID(id string) string {
 	if s.Ripple == "" || strings.HasPrefix(id, s.Ripple+":") {
 		return id
