@@ -41,6 +41,60 @@ func (s Service) Search(ctx context.Context, query string, opts Options) (map[st
 	`, map[string]any{"query": query, "ripple": s.Ripple, "limit": opts.Limit + 1}, opts.Limit)
 }
 
+func (s Service) Metadata(ctx context.Context) (map[string]any, error) {
+	result, err := neo4j.ExecuteQuery(ctx, s.Driver, `
+		CALL {
+			MATCH (n:GraphNode {ripple: $ripple})
+			RETURN count(n) AS nodes
+		}
+		CALL {
+			MATCH ()-[r]->()
+			WHERE r.ripple = $ripple
+			RETURN count(r) AS relationships
+		}
+		OPTIONAL MATCH (ripple:Ripple {name: $ripple})
+		RETURN nodes, relationships, ripple.repo AS repo, ripple.language AS language, ripple.createdAt AS createdAt, ripple.updatedAt AS updatedAt
+	`, map[string]any{"ripple": s.Ripple}, neo4j.EagerResultTransformer)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Records) == 0 {
+		return map[string]any{"ripple": s.Ripple, "nodes": 0, "relationships": 0}, nil
+	}
+	out := result.Records[0].AsMap()
+	out["ripple"] = s.Ripple
+	return out, nil
+}
+
+func (s Service) Types(ctx context.Context) (map[string]any, error) {
+	labelResult, err := neo4j.ExecuteQuery(ctx, s.Driver, `
+		MATCH (n:GraphNode {ripple: $ripple})
+		RETURN coalesce(n.primaryLabel, "Unknown") AS label, count(n) AS count
+		ORDER BY count DESC, label
+	`, map[string]any{"ripple": s.Ripple}, neo4j.EagerResultTransformer)
+	if err != nil {
+		return nil, err
+	}
+	relResult, err := neo4j.ExecuteQuery(ctx, s.Driver, `
+		MATCH ()-[r]->()
+		WHERE r.ripple = $ripple
+		RETURN type(r) AS type, count(r) AS count
+		ORDER BY count DESC, type
+	`, map[string]any{"ripple": s.Ripple}, neo4j.EagerResultTransformer)
+	if err != nil {
+		return nil, err
+	}
+	labels := []map[string]any{}
+	for _, record := range labelResult.Records {
+		labels = append(labels, record.AsMap())
+	}
+	relationships := []map[string]any{}
+	for _, record := range relResult.Records {
+		relationships = append(relationships, record.AsMap())
+	}
+	return map[string]any{"ripple": s.Ripple, "nodeLabels": labels, "relationshipTypes": relationships}, nil
+}
+
 func (s Service) FindSymbol(ctx context.Context, name string, opts Options) (map[string]any, error) {
 	opts = normalize(opts)
 	return queryNodes(ctx, s.Driver, `

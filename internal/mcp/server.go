@@ -93,6 +93,12 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 	var result any
 	var err error
 	switch params.Name {
+	case "codegraph_help":
+		result = s.help()
+	case "get_ripple_info":
+		result, err = s.Query.Metadata(ctx)
+	case "list_node_types":
+		result, err = s.Query.Types(ctx)
 	case "search_code":
 		result, err = s.Query.Search(ctx, firstStringArg(args, "query", "q", "text", "term", "name", "path"), opts)
 	case "find_symbol":
@@ -138,6 +144,53 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": string(text)}}}, nil
 }
 
+func (s Server) help() map[string]any {
+	return map[string]any{
+		"purpose": "CodeGraph MCP helps investigate an indexed codebase by searching files, symbols, packages, routes, tests, and graph relationships inside the selected ripple.",
+		"ripple":  s.Query.Ripple,
+		"repo":    s.Repo,
+		"recommendedWorkflow": []string{
+			"Start broad with search_code using the user's domain term.",
+			"Use find_file to narrow by path when the result mentions a directory.",
+			"Use find_symbol to locate functions, classes, hooks, constants, and exported names.",
+			"Use get_relations with direction outbound for dependencies and inbound for dependents.",
+			"Use open_file_excerpt or open_symbol_body to inspect source after locating a file or symbol.",
+			"Use list_node_types when you need to understand what graph data exists.",
+		},
+		"examples": []map[string]any{
+			{"tool": "search_code", "arguments": map[string]any{"query": "worker", "limit": 20}},
+			{"tool": "find_file", "arguments": map[string]any{"query": "apps/workers/src", "limit": 20}},
+			{"tool": "find_symbol", "arguments": map[string]any{"query": "Worker", "limit": 20}},
+			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "package:@howdy/workers", "direction": "outbound", "depth": 2, "limit": 25}},
+			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "file:apps/workers/src/index.ts", "direction": "inbound", "depth": 2, "limit": 25}},
+			{"tool": "open_file_excerpt", "arguments": map[string]any{"path": "apps/workers/src/index.ts", "startLine": 1, "endLine": 120}},
+		},
+		"argumentAliases": map[string]any{
+			"search":    []string{"query", "q", "text", "term", "name", "path"},
+			"nodeId":    []string{"targetId", "sourceId", "id", "nodeId", "query", "q"},
+			"direction": map[string]string{"outbound": "forward", "out": "forward", "incoming": "reverse", "inbound": "reverse", "in": "reverse"},
+			"filePath":  []string{"path", "file", "filePath"},
+		},
+		"tools": []string{
+			"codegraph_help",
+			"get_ripple_info",
+			"list_node_types",
+			"search_code",
+			"find_symbol",
+			"find_file",
+			"get_dependencies",
+			"get_dependents",
+			"get_relations",
+			"get_impact",
+			"get_route_impact",
+			"get_related_tests",
+			"find_paths",
+			"open_symbol_body",
+			"open_file_excerpt",
+		},
+	}
+}
+
 func (s Server) openFile(path string, start int, end int) (map[string]any, error) {
 	clean := filepath.Clean(filepath.FromSlash(path))
 	full := filepath.Join(s.Repo, clean)
@@ -170,6 +223,9 @@ func errorResponse(id any, code int, message string) map[string]any {
 
 func tools() []map[string]any {
 	return []map[string]any{
+		tool("codegraph_help", "Explain how to use this CodeGraph MCP server, including the current ripple, available tools, argument aliases, and example investigation workflows. Call this first when unsure.", map[string]any{}, []string{}),
+		tool("get_ripple_info", "Return metadata and graph counts for the current ripple.", map[string]any{}, []string{}),
+		tool("list_node_types", "Return node label counts and relationship type counts for the current ripple.", map[string]any{}, []string{}),
 		tool("search_code", "Search all indexed code graph nodes in the current ripple. Use this first for broad terms like worker, auth, route, package names, or paths.", map[string]any{
 			"query": stringSchema("Search text. Aliases: q, text, term, name, path."),
 			"limit": intSchema("Maximum results."),

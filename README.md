@@ -135,7 +135,7 @@ Then verify OpenCode can connect:
 opencode mcp list
 ```
 
-OpenCode should show the server as connected. In prompts, refer to the configured MCP name, for example `use codegraph_my_app to find the files related to auth`.
+OpenCode should show the server as connected. In prompts, refer to the configured MCP name and ask it to start with `codegraph_help`, for example `use codegraph_my_app, call codegraph_help first, then find the files related to auth`.
 
 ## Visualization
 
@@ -149,6 +149,9 @@ The visualization plots every indexed node for one ripple on a canvas, groups no
 
 ## MCP Tools
 
+- `codegraph_help`: explains how to use this MCP, including workflows, aliases, and examples.
+- `get_ripple_info`: returns the current ripple, repo path, language, and graph counts.
+- `list_node_types`: returns node label counts and relationship type counts for the current ripple.
 - `search_code`: broad search across files, symbols, packages, routes, tests, and config nodes.
 - `find_symbol`
 - `find_file`
