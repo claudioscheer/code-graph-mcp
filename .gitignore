@@ -1,0 +1,10 @@
+.env
+.DS_Store
+coverage.out
+dist/
+bin/
+node_modules/
+extractors/typescript/dist/
+coverage/
+.next/
+codegraph-visualization.html

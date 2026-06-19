@@ -1,0 +1,8 @@
+{
+  "name": "fixture-root",
+  "workspaces": ["apps/*", "packages/*"],
+  "dependencies": {
+    "@repo/auth": "workspace:*",
+    "next": "15.0.0"
+  }
+}

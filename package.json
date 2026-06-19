@@ -1,0 +1,29 @@
+{
+  "name": "code-graph-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "build": "tsc -p extractors/typescript/tsconfig.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:golden": "vitest run extractors/typescript/src/**/*.test.ts",
+    "extract:typescript": "tsx extractors/typescript/src/cli.ts",
+    "lint": "tsc -p extractors/typescript/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "dependency-cruiser": "^17.3.1",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.5",
+    "neo4j-driver": "^5.28.2",
+    "ts-morph": "^26.0.0",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.2",
+    "@vitest/coverage-v8": "^4.0.15",
+    "tsx": "^4.20.6",
+    "vitest": "^4.0.15"
+  }
+}
