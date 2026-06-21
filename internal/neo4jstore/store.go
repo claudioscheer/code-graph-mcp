@@ -39,6 +39,10 @@ func (s *Store) Driver() neo4j.DriverWithContext {
 	return s.driver
 }
 
+func (s *Store) VerifyConnectivity(ctx context.Context) error {
+	return s.driver.VerifyConnectivity(ctx)
+}
+
 func (s *Store) ForRipple(name string) *Store {
 	return &Store{driver: s.driver, ripple: name}
 }

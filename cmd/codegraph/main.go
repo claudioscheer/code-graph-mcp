@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/claudioscheer/code-graph-mcp/internal/config"
 	"github.com/claudioscheer/code-graph-mcp/internal/discovery"
@@ -263,6 +264,12 @@ func openStore(ctx context.Context, cfg config.Config) (*neo4jstore.Store, error
 	store, err := neo4jstore.New(cfg.Neo4jURI, cfg.Neo4jUser, cfg.Neo4jPassword)
 	if err != nil {
 		return nil, err
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := store.VerifyConnectivity(connectCtx); err != nil {
+		_ = store.Close(context.Background())
+		return nil, fmt.Errorf("neo4j unavailable at %s within 3s: %w", cfg.Neo4jURI, err)
 	}
 	if err := store.CreateConstraints(ctx); err != nil {
 		_ = store.Close(ctx)
