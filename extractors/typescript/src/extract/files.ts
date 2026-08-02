@@ -1,9 +1,10 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import fg from "fast-glob";
 import { Project, SourceFile } from "ts-morph";
 import { edge, node, stableFileId, stableProjectId } from "../core/events.js";
 import type { EventBuffer } from "../core/emit.js";
-import { exists, normalizePath, relativePath } from "../core/fs.js";
+import { normalizePath, relativePath } from "../core/fs.js";
 import type { GitIgnoreMatcher } from "../core/gitignore.js";
 import { packageForFile, type WorkspacePackage } from "./workspace.js";
 
@@ -15,26 +16,73 @@ export type FileInfo = {
 };
 
 export async function loadProject(repo: string, gitignore?: GitIgnoreMatcher): Promise<{ project: Project; files: SourceFile[] }> {
-  const tsConfigFilePath = exists(path.join(repo, "tsconfig.json")) ? path.join(repo, "tsconfig.json") : undefined;
+  // Avoid tsConfig + addSourceFilesAtPaths directory walks. Yarn/pnpm workspace
+  // monorepos can nest circular node_modules links deep enough to hit ENAMETOOLONG.
+  // Create files from our own glob so ts-morph never scandir's node_modules.
   const project = new Project({
-    tsConfigFilePath,
     skipAddingFilesFromTsConfig: true,
+    skipLoadingLibFiles: true,
+    useInMemoryFileSystem: false,
     compilerOptions: {
       allowJs: true,
       checkJs: false,
       jsx: 4,
       skipLibCheck: true,
+      noResolve: true,
     },
   });
   const paths = await fg(["**/*.{ts,tsx,js,jsx}"], {
     cwd: repo,
     absolute: true,
-    ignore: ["**/node_modules/**", "**/.next/**", "**/dist/**", "**/coverage/**", "**/*.d.ts"],
+    ignore: [
+      "**/node_modules/**",
+      "**/.next/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/coverage/**",
+      "**/.turbo/**",
+      "**/.cache/**",
+      "**/*.d.ts",
+    ],
     onlyFiles: true,
-    dot: true,
+    dot: false,
+    followSymbolicLinks: false,
   });
-  project.addSourceFilesAtPaths(paths.filter((file) => !gitignore?.ignored(relativePath(repo, file))));
-  return { project, files: project.getSourceFiles().filter((file) => !file.isFromExternalLibrary()) };
+  const files: SourceFile[] = [];
+  for (const file of paths) {
+    const rel = relativePath(repo, file);
+    if (rel.split(path.sep).includes("node_modules") || rel.split("/").includes("node_modules")) {
+      continue;
+    }
+    if (gitignore?.ignored(rel)) {
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    // createSourceFile does not walk parent directories looking for more files.
+    files.push(project.createSourceFile(file, text, { overwrite: true, scriptKind: scriptKindForPath(file) }));
+  }
+  return { project, files };
+}
+
+function scriptKindForPath(filePath: string): number | undefined {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".ts":
+      return 3; // ScriptKind.TS
+    case ".tsx":
+      return 4; // ScriptKind.TSX
+    case ".js":
+      return 1; // ScriptKind.JS
+    case ".jsx":
+      return 2; // ScriptKind.JSX
+    default:
+      return undefined;
+  }
 }
 
 export function emitFiles(repo: string, files: SourceFile[], packages: WorkspacePackage[], events: EventBuffer): FileInfo[] {

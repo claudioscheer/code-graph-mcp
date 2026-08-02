@@ -7,15 +7,60 @@ import (
 	"strings"
 )
 
-func formatToolResult(tool string, result any, args map[string]any) (string, error) {
+const defaultMaxItems = 20
+
+// detail levels control how much structure high-level tools return and how
+// aggressively the compact formatter truncates lists.
+//
+//	summary (default) — counts + top paths
+//	files             — fuller file lists, still hard-capped
+//	lines             — includes line matches / snippets when present
+//	raw / json        — full JSON (via format=json, raw=true, or detail=raw)
+func detailArg(args map[string]any) string {
 	if wantsJSON(args) {
+		return "raw"
+	}
+	detail := strings.ToLower(firstStringArg(args, "detail", "view"))
+	switch detail {
+	case "files", "file", "lines", "line", "full", "raw", "json":
+		if detail == "file" {
+			return "files"
+		}
+		if detail == "line" || detail == "full" {
+			return "lines"
+		}
+		if detail == "json" {
+			return "raw"
+		}
+		return detail
+	default:
+		return "summary"
+	}
+}
+
+func maxItemsArg(args map[string]any, fallback int) int {
+	if fallback <= 0 {
+		fallback = defaultMaxItems
+	}
+	value := intArg(args, "maxItems", fallback)
+	if value <= 0 {
+		return fallback
+	}
+	if value > 200 {
+		return 200
+	}
+	return value
+}
+
+func formatToolResult(tool string, result any, args map[string]any) (string, error) {
+	if wantsJSON(args) || detailArg(args) == "raw" {
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return "", err
 		}
 		return string(data), nil
 	}
-	return compactToolResult(tool, result), nil
+	return compactToolResult(tool, result, maxItemsArg(args, defaultMaxItems)), nil
 }
 
 func wantsJSON(args map[string]any) bool {
@@ -25,12 +70,12 @@ func wantsJSON(args map[string]any) bool {
 	return strings.EqualFold(firstStringArg(args, "format", "output"), "json")
 }
 
-func compactToolResult(tool string, result any) string {
+func compactToolResult(tool string, result any, maxItems int) string {
 	values, ok := result.(map[string]any)
 	if !ok {
 		return compactValue(result)
 	}
-	if text := compactGraphResult(tool, values); text != "" {
+	if text := compactGraphResult(tool, values, maxItems); text != "" {
 		return text
 	}
 	var b strings.Builder
@@ -39,8 +84,23 @@ func compactToolResult(tool string, result any) string {
 		b.WriteString(header)
 		b.WriteByte('\n')
 	}
-	writeMapSections(&b, values, 0)
+	writeMapSections(&b, values, 0, maxItems, headerKeys(values))
 	return strings.TrimSpace(b.String())
+}
+
+func headerKeys(values map[string]any) map[string]bool {
+	keys := map[string]bool{}
+	for _, key := range []string{"query", "symbol", "oldName", "callee", "envName", "ripple", "requiredBeforeCall"} {
+		if firstAnyString(values, key) != "" {
+			keys[key] = true
+		}
+	}
+	for _, key := range []string{"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount", "totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites", "truncated", "contextCompleteForPlanning"} {
+		if value, ok := values[key]; ok && isScalar(value) {
+			keys[key] = true
+		}
+	}
+	return keys
 }
 
 func compactHeader(tool string, values map[string]any) string {
@@ -51,7 +111,10 @@ func compactHeader(tool string, values map[string]any) string {
 			break
 		}
 	}
-	for _, key := range []string{"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount", "nodes", "relationships"} {
+	if required := firstAnyString(values, "requiredBeforeCall"); required != "" {
+		parts = append(parts, "requires="+quoteIfNeeded(required))
+	}
+	for _, key := range []string{"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount", "totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites"} {
 		if value, ok := values[key]; ok {
 			if isScalar(value) {
 				parts = append(parts, fmt.Sprintf("%s=%v", key, value))
@@ -61,17 +124,20 @@ func compactHeader(tool string, values map[string]any) string {
 	if value, ok := values["truncated"]; ok {
 		parts = append(parts, fmt.Sprintf("truncated=%v", value))
 	}
+	if value, ok := values["contextCompleteForPlanning"]; ok {
+		parts = append(parts, fmt.Sprintf("planningReady=%v", value))
+	}
 	return strings.Join(parts, " ")
 }
 
-func compactGraphResult(tool string, values map[string]any) string {
+func compactGraphResult(tool string, values map[string]any, maxItems int) string {
 	if rawNodes, ok := values["nodes"].([]map[string]any); ok {
 		var b strings.Builder
 		b.WriteString(compactHeader(tool, values))
 		b.WriteByte('\n')
-		writeNodeList(&b, "nodes", rawNodes, 0)
+		writeNodeList(&b, "nodes", rawNodes, 0, maxItems)
 		if rawRels, ok := values["relationships"].([]map[string]any); ok {
-			writeRelationList(&b, "relationships", rawRels, 0)
+			writeRelationList(&b, "relationships", rawRels, 0, maxItems)
 		}
 		return strings.TrimSpace(b.String())
 	}
@@ -79,22 +145,30 @@ func compactGraphResult(tool string, values map[string]any) string {
 		var b strings.Builder
 		b.WriteString(compactHeader(tool, values))
 		b.WriteByte('\n')
-		for index, path := range rawPaths {
+		shown := min(len(rawPaths), maxItems)
+		for index := 0; index < shown; index++ {
+			path := rawPaths[index]
 			b.WriteString(fmt.Sprintf("%d. path\n", index+1))
 			if nodes, ok := path["nodes"].([]map[string]any); ok {
-				writeNodeList(&b, "nodes", nodes, 2)
+				writeNodeList(&b, "nodes", nodes, 2, maxItems)
 			}
 			if rels, ok := path["relationships"].([]map[string]any); ok {
-				writeRelationList(&b, "relationships", rels, 2)
+				writeRelationList(&b, "relationships", rels, 2, maxItems)
 			}
+		}
+		if len(rawPaths) > maxItems {
+			b.WriteString(fmt.Sprintf("... +%d more paths\n", len(rawPaths)-maxItems))
 		}
 		return strings.TrimSpace(b.String())
 	}
 	return ""
 }
 
-func writeMapSections(b *strings.Builder, values map[string]any, indent int) {
-	scalars := scalarPairs(values, "code", "text", "files", "nodes", "relationships", "paths")
+func writeMapSections(b *strings.Builder, values map[string]any, indent int, maxItems int, skipScalars map[string]bool) {
+	if skipScalars == nil {
+		skipScalars = map[string]bool{}
+	}
+	scalars := scalarPairs(values, skipScalars, "code", "text", "files", "nodes", "relationships", "paths")
 	if len(scalars) > 0 {
 		b.WriteString(indentString(indent))
 		b.WriteString(strings.Join(scalars, " "))
@@ -112,18 +186,30 @@ func writeMapSections(b *strings.Builder, values map[string]any, indent int) {
 		}
 		switch value := values[key].(type) {
 		case []string:
-			writeStringList(b, key, value, indent)
+			writeStringList(b, key, value, indent, maxItems)
 		case []map[string]any:
-			writeMapList(b, key, value, indent)
+			writeMapList(b, key, value, indent, maxItems)
 		case map[string]any:
+			writeNestedMap(b, key, value, indent, maxItems)
+		case map[string]int:
 			if len(value) == 0 {
 				continue
 			}
 			b.WriteString(indentString(indent))
 			b.WriteString(key)
-			b.WriteString(":\n")
-			writeMapSections(b, value, indent+2)
+			b.WriteString(": ")
+			b.WriteString(compactValue(value))
+			b.WriteByte('\n')
 		default:
+			// Normalize map[string][]map[string]any and similar nested containers.
+			if nested, ok := asStringAnyMap(value); ok {
+				writeNestedMap(b, key, nested, indent, maxItems)
+				continue
+			}
+			if items, ok := asMapSlice(value); ok {
+				writeMapList(b, key, items, indent, maxItems)
+				continue
+			}
 			if text := compactValue(value); text != "" {
 				b.WriteString(indentString(indent))
 				b.WriteString(key)
@@ -135,53 +221,73 @@ func writeMapSections(b *strings.Builder, values map[string]any, indent int) {
 	}
 }
 
-func writeMapList(b *strings.Builder, name string, items []map[string]any, indent int) {
+func writeMapList(b *strings.Builder, name string, items []map[string]any, indent int, maxItems int) {
 	if len(items) == 0 {
 		return
 	}
 	b.WriteString(indentString(indent))
 	b.WriteString(fmt.Sprintf("%s (%d)\n", name, len(items)))
-	for index, item := range items {
+	shown := min(len(items), maxItems)
+	for index := 0; index < shown; index++ {
 		b.WriteString(indentString(indent))
-		b.WriteString(fmt.Sprintf("- %s\n", compactMapItem(index+1, item)))
+		b.WriteString(fmt.Sprintf("- %s\n", compactMapItem(index+1, items[index])))
+	}
+	if len(items) > maxItems {
+		b.WriteString(indentString(indent))
+		b.WriteString(fmt.Sprintf("... +%d more\n", len(items)-maxItems))
 	}
 }
 
-func writeNodeList(b *strings.Builder, name string, nodes []map[string]any, indent int) {
+func writeNodeList(b *strings.Builder, name string, nodes []map[string]any, indent int, maxItems int) {
 	if len(nodes) == 0 {
 		return
 	}
 	b.WriteString(indentString(indent))
 	b.WriteString(fmt.Sprintf("%s (%d)\n", name, len(nodes)))
-	for index, node := range nodes {
+	shown := min(len(nodes), maxItems)
+	for index := 0; index < shown; index++ {
 		b.WriteString(indentString(indent))
-		b.WriteString(fmt.Sprintf("- %d. %s\n", index+1, compactNode(node)))
+		b.WriteString(fmt.Sprintf("- %d. %s\n", index+1, compactNode(nodes[index])))
+	}
+	if len(nodes) > maxItems {
+		b.WriteString(indentString(indent))
+		b.WriteString(fmt.Sprintf("... +%d more\n", len(nodes)-maxItems))
 	}
 }
 
-func writeRelationList(b *strings.Builder, name string, rels []map[string]any, indent int) {
+func writeRelationList(b *strings.Builder, name string, rels []map[string]any, indent int, maxItems int) {
 	if len(rels) == 0 {
 		return
 	}
 	b.WriteString(indentString(indent))
 	b.WriteString(fmt.Sprintf("%s (%d)\n", name, len(rels)))
-	for index, rel := range rels {
+	shown := min(len(rels), maxItems)
+	for index := 0; index < shown; index++ {
 		b.WriteString(indentString(indent))
-		b.WriteString(fmt.Sprintf("- %d. %s\n", index+1, compactRelation(rel)))
+		b.WriteString(fmt.Sprintf("- %d. %s\n", index+1, compactRelation(rels[index])))
+	}
+	if len(rels) > maxItems {
+		b.WriteString(indentString(indent))
+		b.WriteString(fmt.Sprintf("... +%d more\n", len(rels)-maxItems))
 	}
 }
 
-func writeStringList(b *strings.Builder, name string, values []string, indent int) {
+func writeStringList(b *strings.Builder, name string, values []string, indent int, maxItems int) {
 	if len(values) == 0 {
 		return
 	}
 	b.WriteString(indentString(indent))
 	b.WriteString(fmt.Sprintf("%s (%d)\n", name, len(values)))
-	for _, value := range values {
+	shown := min(len(values), maxItems)
+	for index := 0; index < shown; index++ {
 		b.WriteString(indentString(indent))
 		b.WriteString("- ")
-		b.WriteString(value)
+		b.WriteString(values[index])
 		b.WriteByte('\n')
+	}
+	if len(values) > maxItems {
+		b.WriteString(indentString(indent))
+		b.WriteString(fmt.Sprintf("... +%d more\n", len(values)-maxItems))
 	}
 }
 
@@ -194,13 +300,24 @@ func compactMapItem(index int, item map[string]any) string {
 	if line := item["line"]; line != nil {
 		parts = append(parts, fmt.Sprintf("line=%v", line))
 	}
-	for _, key := range []string{"category", "role", "kind", "count", "hitCount", "matchCount", "readCount", "owner", "reason", "truncated"} {
+	for _, key := range []string{"category", "role", "kind", "count", "hitCount", "matchCount", "readCount", "owner", "reason", "why", "level", "truncated", "hasRequiredBeforeCall"} {
 		if value, ok := item[key]; ok && isScalar(value) {
 			parts = append(parts, fmt.Sprintf("%s=%v", key, value))
 		}
 	}
+	if owners := stringSlice(item["owners"]); len(owners) > 0 {
+		shown := min(len(owners), 3)
+		label := strings.Join(owners[:shown], ",")
+		if len(owners) > shown {
+			label += fmt.Sprintf("+%d", len(owners)-shown)
+		}
+		parts = append(parts, "owners="+label)
+	}
+	if ownerCount, ok := item["ownerCount"]; ok && isScalar(ownerCount) && len(stringSlice(item["owners"])) == 0 {
+		parts = append(parts, fmt.Sprintf("ownerCount=%v", ownerCount))
+	}
 	if snippet := firstAnyString(item, "snippet", "text"); snippet != "" {
-		parts = append(parts, "snippet="+compactLine(snippet, 140))
+		parts = append(parts, "snippet="+compactLine(snippet, 100))
 	}
 	return strings.Join(parts, " ")
 }
@@ -255,7 +372,8 @@ func compactRelation(rel map[string]any) string {
 	if relType != "" {
 		parts = append(parts, relType)
 	}
-	for _, key := range []string{"from", "to", "startId", "endId"} {
+	// Prefer human sourceIds over opaque element ids when present.
+	for _, key := range []string{"from", "to", "startSourceId", "endSourceId"} {
 		if value := firstAnyString(rel, key); value != "" {
 			parts = append(parts, key+"="+value)
 		}
@@ -266,10 +384,15 @@ func compactRelation(rel map[string]any) string {
 	return strings.Join(parts, " ")
 }
 
-func scalarPairs(values map[string]any, exclude ...string) []string {
+func scalarPairs(values map[string]any, skip map[string]bool, exclude ...string) []string {
 	excluded := map[string]bool{}
 	for _, key := range exclude {
 		excluded[key] = true
+	}
+	for key, value := range skip {
+		if value {
+			excluded[key] = true
+		}
 	}
 	keys := sortedKeys(values)
 	pairs := []string{}
@@ -293,7 +416,7 @@ func sortedKeys(values map[string]any) []string {
 
 func isScalar(value any) bool {
 	switch value.(type) {
-	case nil, string, bool, int, int64, float64:
+	case nil, string, bool, int, int32, int64, float32, float64:
 		return true
 	default:
 		return false
@@ -309,7 +432,18 @@ func compactValue(value any) string {
 	case []string:
 		return strings.Join(typed, ", ")
 	case map[string]any:
-		return strings.Join(scalarPairs(typed), " ")
+		return strings.Join(scalarPairs(typed, nil), " ")
+	case map[string]int:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%d", key, typed[key]))
+		}
+		return strings.Join(parts, " ")
 	default:
 		return fmt.Sprintf("%v", typed)
 	}
@@ -332,4 +466,94 @@ func quoteIfNeeded(value string) string {
 
 func indentString(indent int) string {
 	return strings.Repeat(" ", indent)
+}
+
+func stringSlice(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func writeNestedMap(b *strings.Builder, key string, value map[string]any, indent int, maxItems int) {
+	if len(value) == 0 {
+		return
+	}
+	// Prefer inline scalar maps (counts) over nested sections.
+	if pairs := scalarPairs(value, nil); len(pairs) == len(value) {
+		b.WriteString(indentString(indent))
+		b.WriteString(key)
+		b.WriteString(": ")
+		b.WriteString(strings.Join(pairs, " "))
+		b.WriteByte('\n')
+		return
+	}
+	b.WriteString(indentString(indent))
+	b.WriteString(key)
+	b.WriteString(":\n")
+	writeMapSections(b, value, indent+2, maxItems, nil)
+}
+
+func asStringAnyMap(value any) (map[string]any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed, true
+	case map[string][]map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, items := range typed {
+			out[key] = items
+		}
+		return out, true
+	case map[string][]string:
+		out := make(map[string]any, len(typed))
+		for key, items := range typed {
+			out[key] = items
+		}
+		return out, true
+	case map[string]int:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func asMapSlice(value any) ([]map[string]any, bool) {
+	switch typed := value.(type) {
+	case []map[string]any:
+		return typed, true
+	case []any:
+		out := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if entry, ok := item.(map[string]any); ok {
+				out = append(out, entry)
+			} else {
+				return nil, false
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// limitSlice caps a slice for summary responses and reports whether truncation occurred.
+func limitSlice[T any](items []T, limit int) ([]T, bool) {
+	if limit <= 0 || len(items) <= limit {
+		return items, false
+	}
+	return items[:limit], true
 }

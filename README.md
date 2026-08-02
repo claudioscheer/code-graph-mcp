@@ -23,6 +23,69 @@ Not implemented yet:
 
 The extractor protocol is language-neutral, so new language support should be added as a new subprocess extractor that emits the same `codegraph.v1` NDJSON events. The tradeoff is that v1 keeps the Go server stable and modular, but only the TypeScript/JavaScript extractor is production-usable today.
 
+## When To Use CodeGraph (And When Not To)
+
+CodeGraph is a **specialized impact and navigation layer** for agents. It is **not** a replacement for normal agent tools such as Read, Grep/`rg`, bash, git, or an IDE/LSP.
+
+**Recommended policy for agents:**
+
+1. Use CodeGraph **first** for planning, blast radius, rename impact, env usage, and call-site contract questions (one high-level tool).
+2. Use normal tools to **read exact source, edit code, run tests, and check git**.
+3. Never use CodeGraph as the only code-reading path.
+4. Treat graph answers as incomplete unless the index is fresh and you understand the ripple `analysisMode` (fast mode may omit symbol-level relations).
+
+### Why CodeGraph is good
+
+| Strength | What that means for agents |
+|---|---|
+| Task-shaped tools | One call for “impact of X”, “rename Y”, or “feature context” instead of many exploratory hops |
+| Lower planning thrash | Bounds entry points, likely edit files, tests, and callers before the agent opens lots of files |
+| Token-conscious defaults | Compact summary text, small list caps, low graph depth/limit; raise `detail` only when needed |
+| Classified search | Env runtime reads, rename buckets (runtime/config/tests/docs/scripts), call-site owners |
+| Indexed structure | Packages, files, routes, and dependency neighborhoods when the ripple index is good |
+| Cross-file recipes | Blast radius and contract checks that are awkward to express as a single ad hoc `rg` |
+
+CodeGraph is strongest when the pain is **agent thrash on large repos** (many tools, still missing callers/tests) rather than “find this string.”
+
+### Why CodeGraph is a bad default for everything
+
+| Limitation | What that means for agents |
+|---|---|
+| Not a source of truth | Index can be stale after local edits until you reindex; filesystem tools stay authoritative for current text |
+| Incomplete graph in practice | Fast mode may skip symbol relationship traversal on large repos; graph “callers” can be partial |
+| Overlaps with `rg` | Literal counts, much of impact analysis, and env search are classified filesystem search. Agents that already use Grep well get a lot of that without MCP |
+| Weak for reading/editing | Excerpts are capped; implementation work still needs normal Read and the editor |
+| Setup and ops cost | Neo4j, extract, index, serve, and reindex. Not free for every session |
+| Search noise | Broad graph search can return nested locals/symbols that match by id/path substring |
+| No types / no runtime proof | Static analysis only. Dynamic imports, DI, generated code, and runtime-only behavior are outside guarantees |
+| Worse than git/LSP for some jobs | History, blame, diffs, and true go-to-definition while editing belong to git and the IDE |
+
+### Prefer CodeGraph for
+
+- Feature planning pack (entry points, likely files, tests, compact blast radius)
+- “What breaks if this function/hook/component changes?”
+- Rename or migration impact for a name or env var
+- “Which files read `process.env.NAME` at runtime?”
+- “Every call to X must be preceded by Y”
+- Package/file dependency neighborhood for a known node id (with a warm index)
+
+### Prefer normal agent tools for
+
+- Reading exact implementation or applying edits (Read / editor)
+- Ad hoc exact-string or regex search (Grep / `rg`)
+- Opening one known path
+- Git history, blame, status, diffs
+- Type-aware navigation while editing (LSP / IDE)
+- Freshness-critical answers right after unindexed local changes
+
+### Bottom line
+
+CodeGraph is a **prefetch and impact accelerator**, not a **general tool replacement**.
+
+> Use CodeGraph once to bound the problem. Use normal tools to read and change the code.
+
+If the main need is simple string search, stick with Grep/`rg`. If the main need is fewer exploratory hops and tighter planning context on large TypeScript monorepos, prefer the high-level CodeGraph tools first, then fall through to normal tools.
+
 ## Quick Start
 
 ```bash
@@ -137,7 +200,7 @@ Then verify OpenCode can connect:
 opencode mcp list
 ```
 
-OpenCode should show the server as connected. In prompts, refer to the configured MCP name and ask it to start with `codegraph_help`, for example `use codegraph_my_app, call codegraph_help first, then find the files related to billing`.
+OpenCode should show the server as connected. In prompts, refer to the configured MCP name and call a task tool directly, for example `use codegraph_my_app, call prepare_feature_context with query billing`. Prefer high-level tools over `codegraph_help`; use help only when tool choice is unclear.
 
 ## Visualization
 
@@ -151,25 +214,25 @@ The visualization plots every indexed node for one ripple on a canvas, groups no
 
 ## MCP Tools
 
-- `codegraph_help`: explains how to use this MCP, including workflows, aliases, and examples.
-- `get_ripple_info`: returns the current ripple, repo path, language, and graph counts.
-- `get_index_freshness`: returns ripple metadata plus local repo branch and HEAD when available.
-- `list_node_types`: returns node label counts and relationship type counts for the current ripple.
-- `count_literal_files`: counts unique files containing an exact string and returns only paths plus category counts.
-- `find_env_usages`: finds actual runtime `process.env.NAME` read sites and returns files plus read counts.
-- `analyze_rename_impact`: one-call rename impact analysis for env vars and other exact names, with categorized file lists and compact graph relationship summaries.
-- `analyze_function_impact`: one-call blast-radius analysis for functions, hooks, components, methods, or exported symbol names.
-- `analyze_callsite_contract`: one-call analysis for feature work that requires every existing call to one function to be preceded by another check.
-- `prepare_feature_context`: one-call starter context pack for feature work, including entry points, likely edit files, tests, dependency summaries, and bounded blast radius.
-- `search_code`: broad search across files, symbols, packages, routes, tests, and config nodes.
-- `find_symbol`
-- `find_file`
-- `get_dependencies`
-- `get_dependents`
-- `get_relations`
-- `get_impact`
-- `get_route_impact`
-- `get_related_tests`
-- `find_paths`
-- `open_symbol_body`
-- `open_file_excerpt`
+See [When To Use CodeGraph (And When Not To)](#when-to-use-codegraph-and-when-not-to) for how agents should combine this MCP with Read, Grep, bash, and git.
+
+Results default to **compact summary text** to keep agent token use low. Pass `detail=files`, `detail=lines`, or `raw=true` only when you need more structure. Graph tools default to `depth=1` and `limit=20`. List outputs hard-cap at `maxItems` (default 20) and print `... +N more` when truncated.
+
+### High-level (prefer these)
+
+- `prepare_feature_context`: one-call planning pack (entry points, likely edit files, tests, compact blast radius).
+- `analyze_function_impact`: blast radius for a function/hook/component/symbol. `transitiveDepth` defaults to 0.
+- `analyze_rename_impact`: rename/migration impact grouped by runtime/config/tests/docs/scripts.
+- `analyze_callsite_contract`: find call sites missing a required pre-call check.
+- `count_literal_files`: exact string file counts and paths.
+- `find_env_usages`: runtime `process.env.NAME` reads only.
+
+### Graph / source
+
+- `search_code`, `find_symbol`, `find_file`: indexed graph search.
+- `get_relations`, `get_dependencies`, `get_dependents`, `find_paths`: graph traversal (keep depth/limit low).
+- `open_file_excerpt`, `open_symbol_body`: source text after paths are known (default excerpt 40 lines, hard max 120).
+- `get_ripple_info`, `get_index_freshness`, `list_node_types`: index metadata.
+- `codegraph_help`: short router only; do not call this first on every task.
+
+Hidden aliases kept for older clients but not advertised: `get_impact`, `get_route_impact`, `get_related_tests`, `search_literal`.

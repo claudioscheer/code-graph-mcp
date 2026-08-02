@@ -234,13 +234,16 @@ func unscopedID(ripple string, id string) string {
 
 func normalize(opts Options) Options {
 	if opts.Depth <= 0 {
-		opts.Depth = 2
+		opts.Depth = 1
 	}
 	if opts.Depth > 8 {
 		opts.Depth = 8
 	}
 	if opts.Limit <= 0 {
-		opts.Limit = 100
+		opts.Limit = 20
+	}
+	if opts.Limit > 200 {
+		opts.Limit = 200
 	}
 	if opts.MinConfidence <= 0 {
 		opts.MinConfidence = 0.6
@@ -261,7 +264,7 @@ func queryNodes(ctx context.Context, driver neo4j.DriverWithContext, query strin
 		if i >= limit {
 			break
 		}
-		nodes = append(nodes, nodeMap(record.AsMap()["node"].(neo4j.Node)))
+		nodes = append(nodes, nodeMapLean(record.AsMap()["node"].(neo4j.Node)))
 	}
 	return map[string]any{"nodes": nodes, "returned": len(nodes), "totalKnown": len(result.Records), "truncated": len(result.Records) > limit}, nil
 }
@@ -280,11 +283,11 @@ func queryPathsAsSlice(ctx context.Context, driver neo4j.DriverWithContext, quer
 		values := record.AsMap()
 		for _, raw := range values["nodes"].([]any) {
 			node := raw.(neo4j.Node)
-			nodeByID[node.ElementId] = nodeMap(node)
+			nodeByID[node.ElementId] = nodeMapLean(node)
 		}
 		for _, raw := range values["relationships"].([]any) {
 			rel := raw.(neo4j.Relationship)
-			relByID[rel.ElementId] = relMap(rel)
+			relByID[rel.ElementId] = relMapLean(rel)
 		}
 	}
 	nodes := []map[string]any{}
@@ -311,17 +314,18 @@ func queryPathResults(ctx context.Context, driver neo4j.DriverWithContext, query
 		values := record.AsMap()
 		nodes := []map[string]any{}
 		for _, raw := range values["nodes"].([]any) {
-			nodes = append(nodes, nodeMap(raw.(neo4j.Node)))
+			nodes = append(nodes, nodeMapLean(raw.(neo4j.Node)))
 		}
 		rels := []map[string]any{}
 		for _, raw := range values["relationships"].([]any) {
-			rels = append(rels, relMap(raw.(neo4j.Relationship)))
+			rels = append(rels, relMapLean(raw.(neo4j.Relationship)))
 		}
 		paths = append(paths, map[string]any{"nodes": nodes, "relationships": rels})
 	}
 	return map[string]any{"paths": paths, "returned": len(paths), "totalKnown": len(result.Records), "truncated": len(result.Records) > limit}, nil
 }
 
+// nodeMap returns full node properties. Used when opening a symbol body needs start/end lines.
 func nodeMap(node neo4j.Node) map[string]any {
 	out := map[string]any{}
 	for key, value := range node.Props {
@@ -331,13 +335,65 @@ func nodeMap(node neo4j.Node) map[string]any {
 	return out
 }
 
-func relMap(rel neo4j.Relationship) map[string]any {
+// nodeMapLean projects only agent-useful fields for search/relation responses.
+func nodeMapLean(node neo4j.Node) map[string]any {
+	props := node.Props
 	out := map[string]any{}
-	for key, value := range rel.Props {
-		out[key] = value
+	if sourceID, ok := props["sourceId"]; ok {
+		out["sourceId"] = sourceID
+	} else if id, ok := props["id"]; ok {
+		out["sourceId"] = id
 	}
-	out["type"] = rel.Type
-	out["startId"] = rel.StartElementId
-	out["endId"] = rel.EndElementId
+	if label, ok := props["primaryLabel"]; ok {
+		out["primaryLabel"] = label
+	} else if len(node.Labels) > 0 {
+		// Prefer the most specific non-GraphNode label.
+		for _, label := range node.Labels {
+			if label != "GraphNode" {
+				out["primaryLabel"] = label
+				break
+			}
+		}
+	}
+	for _, key := range []string{"name", "kind", "packageId"} {
+		if value, ok := props[key]; ok && value != nil && value != "" {
+			out[key] = value
+		}
+	}
+	path, _ := props["path"].(string)
+	if path == "" {
+		path, _ = props["filePath"].(string)
+	}
+	if path != "" {
+		out["path"] = path
+		out["filePath"] = path
+	}
+	if startLine, ok := props["startLine"]; ok && startLine != nil {
+		out["startLine"] = startLine
+	}
+	return out
+}
+
+func relMapLean(rel neo4j.Relationship) map[string]any {
+	props := rel.Props
+	out := map[string]any{"type": rel.Type}
+	for _, key := range []string{"sourceFile", "startLine", "endLine", "confidence", "from", "to"} {
+		if value, ok := props[key]; ok && value != nil {
+			out[key] = value
+		}
+	}
+	// Prefer stable source ids from props when extractors set them.
+	if from, ok := props["sourceId"]; ok {
+		out["from"] = from
+	}
+	if to, ok := props["targetId"]; ok {
+		out["to"] = to
+	}
+	if out["from"] == nil {
+		out["startId"] = rel.StartElementId
+	}
+	if out["to"] == nil {
+		out["endId"] = rel.EndElementId
+	}
 	return out
 }

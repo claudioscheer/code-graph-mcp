@@ -91,7 +91,8 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 			return nil, err
 		}
 	}
-	opts := graph.Options{Depth: intArg(args, "depth", 2), Limit: intArg(args, "limit", 100), MinConfidence: floatArg(args, "minConfidence", 0.6)}
+	// Agent-safe defaults: small result budgets. Raise limit/depth/detail only when needed.
+	opts := graph.Options{Depth: intArg(args, "depth", 1), Limit: intArg(args, "limit", 20), MinConfidence: floatArg(args, "minConfidence", 0.6)}
 	var result any
 	var err error
 	switch params.Name {
@@ -108,6 +109,7 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 	case "count_literal_files":
 		result, err = s.countLiteralFiles(firstStringArg(args, "query", "q", "text", "term"), args)
 	case "search_literal":
+		// Hidden alias: prefer count_literal_files, or pass detail=lines.
 		result, err = s.searchLiteral(firstStringArg(args, "query", "q", "text", "term"), args)
 	case "find_env_usages":
 		result, err = s.findEnvUsages(firstStringArg(args, "envName", "name", "query", "q", "text", "term"), args)
@@ -133,12 +135,13 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 		opts.Direction = directionArg(args, "both")
 		result, err = s.Query.Relations(ctx, nodeIDArg(args), opts)
 	case "get_impact", "get_route_impact", "get_related_tests":
+		// Hidden aliases of reverse get_relations (kept for older clients).
 		opts.Direction = "reverse"
 		result, err = s.Query.Relations(ctx, nodeIDArg(args), opts)
 	case "find_paths":
 		result, err = s.Query.Paths(ctx, firstStringArg(args, "fromId", "from", "sourceId", "startId", "source"), firstStringArg(args, "toId", "to", "targetId", "endId", "target"), opts)
 	case "open_file_excerpt":
-		result, err = s.openFile(firstStringArg(args, "path", "file", "filePath"), intArg(args, "startLine", 1), intArg(args, "endLine", 80))
+		result, err = s.openFile(firstStringArg(args, "path", "file", "filePath"), intArg(args, "startLine", 1), intArg(args, "endLine", 40))
 	case "open_symbol_body":
 		symbolID := firstStringArg(args, "symbolId", "id", "targetId", "sourceId")
 		if s.Query.Ripple != "" {
@@ -160,172 +163,33 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 
 func (s Server) help() map[string]any {
 	return map[string]any{
-		"purpose": "CodeGraph MCP helps investigate an indexed codebase by searching files, symbols, packages, routes, tests, and graph relationships inside the selected ripple.",
 		"ripple":  s.Query.Ripple,
 		"repo":    s.Repo,
-		"relationCoverage": []string{
-			"Indexes all statically resolvable relations when the ripple was built with analysisMode=full.",
-			"Fast-mode ripples may intentionally omit symbol-level call/type/render relations on large repos.",
-			"Raw identifier reference extraction is disabled by default because it is memory-heavy on large repos.",
-			"Runtime-only dynamic relations are outside static graph guarantees.",
-			"Call get_index_freshness to inspect the current ripple analysisMode before treating graph relations as complete.",
+		"purpose": "Token-efficient code investigation for one indexed ripple. Prefer one high-level tool, then open source only for exact lines.",
+		"router": []string{
+			"feature start / planning -> prepare_feature_context",
+			"callers / blast radius -> analyze_function_impact",
+			"rename / migration -> analyze_rename_impact",
+			"env runtime reads -> find_env_usages",
+			"exact text count -> count_literal_files",
+			"guard before every call -> analyze_callsite_contract",
+			"broad explore -> search_code / find_symbol / find_file",
+			"deps for a known node id -> get_relations (depth=1, limit=20)",
+			"source text -> open_file_excerpt / open_symbol_body after paths are known",
+			"index age / mode -> get_index_freshness",
 		},
-		"howToChoose": []string{
-			"Need starter context before feature work: use prepare_feature_context first.",
-			"Need every call site for a function, hook, component, method, or exported symbol: use analyze_function_impact.",
-			"Need to enforce a new pre-call check before existing calls: use analyze_callsite_contract.",
-			"Need files affected by a rename: use analyze_rename_impact.",
-			"Need to count exact text references: use count_literal_files.",
-			"Need runtime process.env reads only: use find_env_usages.",
-			"Need generic graph exploration: use search_code, then find_symbol or find_file, then get_relations.",
-			"Need source text: open files only after a high-level command identifies the specific file or symbol.",
-		},
-		"recommendedWorkflow": []string{
-			"For planning questions, prefer one high-level command before manual graph traversal.",
-			"If the user asks for feature impact, call prepare_feature_context or analyze_function_impact before reading files.",
-			"If the user asks whether all callers need a new guard/check, call analyze_callsite_contract.",
-			"If the user asks how many files reference exact text, call count_literal_files rather than search_code.",
-			"If the user asks which files read an env var at runtime, call find_env_usages rather than broad literal search.",
-			"If the user asks what files change for a rename, call analyze_rename_impact.",
-			"Use get_index_freshness when comparing indexed answers to a live checkout.",
-			"Use list_node_types when you need to understand what graph data exists.",
-			"Use search_code for broad terms only when no high-level command matches the task.",
-			"Use find_file to narrow by path when the result mentions a directory.",
-			"Use find_symbol to locate functions, classes, hooks, constants, and exported names.",
-			"Use get_relations with direction outbound for dependencies and inbound for dependents.",
-			"Use open_file_excerpt or open_symbol_body only after locating a specific file or symbol.",
-		},
-		"commandGuide": []map[string]any{
-			{
-				"tool":     "prepare_feature_context",
-				"useWhen":  "Starting feature work and needing entry points, likely edit files, tests, dependencies, index freshness, and bounded blast radius.",
-				"returns":  []string{"entryPoints", "directChangeFiles", "relatedTests", "blastRadius", "dependencySummary", "suggestedFollowUpReads"},
-				"nextStep": "If contextCompleteForPlanning is true, plan from the response. Read only suggestedFollowUpReads when implementing or exact lines are needed.",
-			},
-			{
-				"tool":     "analyze_function_impact",
-				"useWhen":  "A named function, hook, component, method, or exported symbol may change behavior and callers need review.",
-				"returns":  []string{"definitions", "imports", "callSites", "references", "transitive owner expansion", "graphSummary"},
-				"nextStep": "Use callSites for direct edits and transitive owners for broader blast radius. Increase transitiveDepth only when needed.",
-			},
-			{
-				"tool":     "analyze_callsite_contract",
-				"useWhen":  "Every existing call to one callee must be preceded by another check or setup call in the same enclosing function.",
-				"returns":  []string{"missing call sites", "satisfied call sites", "owners", "line numbers", "implementationGuidance"},
-				"nextStep": "Edit missing call sites. Review unowned call sites manually because the scanner could not identify an enclosing function.",
-			},
-			{
-				"tool":     "analyze_rename_impact",
-				"useWhen":  "A literal, env var, path, package, or symbol is being renamed and stale references must be found.",
-				"returns":  []string{"filesToChange grouped by runtime/config/tests/docs/scripts", "match counts", "graphSummary", "external notes"},
-				"nextStep": "Update grouped files by priority: runtime first, then config/tests/docs/scripts. For env vars, update external secret stores too.",
-			},
-			{
-				"tool":     "find_env_usages",
-				"useWhen":  "You only care about runtime reads of process.env.NAME, not docs, tests, or config assignments.",
-				"returns":  []string{"runtime read files", "read counts", "optional lines/snippets"},
-				"nextStep": "Use lines or snippets only when exact edit locations are required.",
-			},
-			{
-				"tool":     "count_literal_files",
-				"useWhen":  "The user asks how many files contain exact text, or wants a compact literal reference count.",
-				"returns":  []string{"unique file count", "total match count", "category counts", "paths"},
-				"nextStep": "Use analyze_rename_impact if the count implies a rename or migration task.",
-			},
-			{
-				"tool":     "search_code",
-				"useWhen":  "Exploring an unknown concept, package, route, file path, or term where no higher-level command applies.",
-				"returns":  []string{"matching indexed graph nodes"},
-				"nextStep": "Use find_symbol, find_file, or get_relations on returned node IDs.",
-			},
-			{
-				"tool":     "get_relations",
-				"useWhen":  "You have a node ID and need dependency or dependent graph traversal.",
-				"returns":  []string{"relationship paths from the indexed graph"},
-				"nextStep": "Use direction outbound for dependencies and inbound/reverse for dependents.",
-			},
-		},
-		"workflowRecipes": []map[string]any{
-			{
-				"task":  "Start feature work around a symbol",
-				"calls": []map[string]any{{"tool": "prepare_feature_context", "arguments": map[string]any{"query": "resolveTenantAccount", "symbol": "resolveTenantAccount"}}},
-			},
-			{
-				"task":  "Find blast radius of a behavior change",
-				"calls": []map[string]any{{"tool": "analyze_function_impact", "arguments": map[string]any{"symbol": "resolveTenantAccount", "transitiveDepth": 1}}},
-			},
-			{
-				"task":  "Require a guard before every call",
-				"calls": []map[string]any{{"tool": "analyze_callsite_contract", "arguments": map[string]any{"callee": "performAction", "requiredBeforeCall": "assertActionAllowed", "includeTests": false}}},
-			},
-			{
-				"task":  "Rename an env var",
-				"calls": []map[string]any{{"tool": "analyze_rename_impact", "arguments": map[string]any{"oldName": "SERVICE_LOGIN_EMAIL", "kind": "env"}}},
-			},
-			{
-				"task":  "Count exact references",
-				"calls": []map[string]any{{"tool": "count_literal_files", "arguments": map[string]any{"query": "SERVICE_LOGIN_EMAIL"}}},
-			},
-			{
-				"task": "Explore graph manually",
-				"calls": []map[string]any{
-					{"tool": "search_code", "arguments": map[string]any{"query": "billing", "limit": 20}},
-					{"tool": "get_relations", "arguments": map[string]any{"sourceId": "file:src/main.ts", "direction": "both", "depth": 2}},
-				},
-			},
-		},
-		"outputGuidance": []string{
-			"Tool results default to compact text to reduce token usage.",
-			"Use raw=true or format=json only when structured JSON is required for debugging or automation.",
-			"Prefer high-level summary fields over opening files when answering planning questions.",
-			"Use snippets=false unless exact source text is required; snippets increase token usage.",
-			"Report truncation when present and rerun with higher limits only if it changes the answer.",
-			"Treat unowned call sites as requiring manual follow-up before edits.",
-			"Use suggestedFollowUpReads from prepare_feature_context as the first files to inspect for implementation.",
+		"tokenRules": []string{
+			"Defaults return compact summary text. Raise detail only when needed: detail=summary|files|lines, or raw=true for JSON.",
+			"Do not open files for planning. Use suggestedFollowUpReads or callSites paths only when implementing.",
+			"If truncated=true, raise limit or detail only if that changes the answer.",
+			"Fast-mode indexes may omit symbol-level relations; filesystem impact tools remain authoritative for text/call sites.",
 		},
 		"examples": []map[string]any{
 			{"tool": "prepare_feature_context", "arguments": map[string]any{"query": "resolveTenantAccount"}},
-			{"tool": "count_literal_files", "arguments": map[string]any{"query": "SERVICE_LOGIN_EMAIL"}},
-			{"tool": "find_env_usages", "arguments": map[string]any{"envName": "SERVICE_LOGIN_EMAIL"}},
-			{"tool": "analyze_rename_impact", "arguments": map[string]any{"oldName": "SERVICE_LOGIN_EMAIL", "kind": "env"}},
 			{"tool": "analyze_function_impact", "arguments": map[string]any{"symbol": "resolveTenantAccount"}},
-			{"tool": "analyze_callsite_contract", "arguments": map[string]any{"callee": "performAction", "requiredBeforeCall": "assertActionAllowed"}},
-			{"tool": "search_code", "arguments": map[string]any{"query": "billing", "limit": 20}},
-			{"tool": "find_file", "arguments": map[string]any{"query": "src/main.ts", "limit": 20}},
-			{"tool": "find_symbol", "arguments": map[string]any{"query": "BillingService", "limit": 20}},
-			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "package:@app/main", "direction": "outbound", "depth": 2, "limit": 25}},
-			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "file:src/main.ts", "direction": "inbound", "depth": 2, "limit": 25}},
-			{"tool": "open_file_excerpt", "arguments": map[string]any{"path": "src/main.ts", "startLine": 1, "endLine": 120}},
-		},
-		"argumentAliases": map[string]any{
-			"search":    []string{"query", "q", "text", "term", "name", "path"},
-			"nodeId":    []string{"targetId", "sourceId", "id", "nodeId", "query", "q"},
-			"direction": map[string]string{"outbound": "forward", "out": "forward", "incoming": "reverse", "inbound": "reverse", "in": "reverse"},
-			"filePath":  []string{"path", "file", "filePath"},
-		},
-		"tools": []string{
-			"codegraph_help",
-			"get_ripple_info",
-			"get_index_freshness",
-			"list_node_types",
-			"count_literal_files",
-			"find_env_usages",
-			"analyze_rename_impact",
-			"analyze_function_impact",
-			"analyze_callsite_contract",
-			"prepare_feature_context",
-			"search_code",
-			"find_symbol",
-			"find_file",
-			"get_dependencies",
-			"get_dependents",
-			"get_relations",
-			"get_impact",
-			"get_route_impact",
-			"get_related_tests",
-			"find_paths",
-			"open_symbol_body",
-			"open_file_excerpt",
+			{"tool": "analyze_rename_impact", "arguments": map[string]any{"oldName": "SERVICE_LOGIN_EMAIL", "kind": "env"}},
+			{"tool": "count_literal_files", "arguments": map[string]any{"query": "SERVICE_LOGIN_EMAIL"}},
+			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "file:src/main.ts", "direction": "inbound"}},
 		},
 	}
 }
@@ -347,13 +211,24 @@ func (s Server) openFile(path string, start int, end int) (map[string]any, error
 	if end < start {
 		end = start
 	}
+	// Hard cap excerpt size so agents cannot dump huge files by accident.
+	const maxExcerptLines = 120
+	if end-start+1 > maxExcerptLines {
+		end = start + maxExcerptLines - 1
+	}
 	if start > len(lines) {
-		return map[string]any{"path": path, "text": ""}, nil
+		return map[string]any{"path": path, "startLine": start, "endLine": start, "text": "", "truncated": true}, nil
 	}
 	if end > len(lines) {
 		end = len(lines)
 	}
-	return map[string]any{"path": path, "startLine": start, "endLine": end, "text": strings.Join(lines[start-1:end], "\n")}, nil
+	return map[string]any{
+		"path":      path,
+		"startLine": start,
+		"endLine":   end,
+		"text":      strings.Join(lines[start-1:end], "\n"),
+		"truncated": end < len(lines) && end-start+1 >= maxExcerptLines,
+	}, nil
 }
 
 func (s Server) openSymbolBody(ctx context.Context, symbolID string, contextLines int) (map[string]any, error) {
@@ -394,6 +269,9 @@ func (s Server) openSymbolBody(ctx context.Context, symbolID string, contextLine
 }
 
 func (s Server) searchLiteral(query string, args map[string]any) (map[string]any, error) {
+	detail := detailArg(args)
+	includeLines := detail == "lines" || boolArg(args, "lines", false)
+	includeSnippets := detail == "lines" || boolArg(args, "snippets", false)
 	result, err := searchLiteralFiles(s.Repo, query, literalSearchOptions{
 		IncludeTests:    boolArg(args, "includeTests", true),
 		IncludeDocs:     boolArg(args, "includeDocs", true),
@@ -401,10 +279,10 @@ func (s Server) searchLiteral(query string, args map[string]any) (map[string]any
 		IncludeScripts:  boolArg(args, "includeScripts", true),
 		IncludeHidden:   boolArg(args, "includeHidden", false),
 		IncludeTmp:      boolArg(args, "includeTmp", false),
-		IncludeLines:    boolArg(args, "lines", false),
-		IncludeSnippets: boolArg(args, "snippets", false),
+		IncludeLines:    includeLines,
+		IncludeSnippets: includeSnippets,
 		MatchesPerFile:  intArg(args, "matchesPerFile", 3),
-		Limit:           intArg(args, "limit", 100),
+		Limit:           intArg(args, "limit", 40),
 	})
 	if err != nil {
 		return nil, err
@@ -416,10 +294,12 @@ func (s Server) searchLiteral(query string, args map[string]any) (map[string]any
 		"counts":       result.Counts,
 		"files":        result.Files,
 		"truncated":    result.Truncated,
+		"detail":       detail,
 	}, nil
 }
 
 func (s Server) countLiteralFiles(query string, args map[string]any) (map[string]any, error) {
+	limit := intArg(args, "limit", 40)
 	result, err := searchLiteralFiles(s.Repo, query, literalSearchOptions{
 		IncludeTests:    boolArg(args, "includeTests", true),
 		IncludeDocs:     boolArg(args, "includeDocs", true),
@@ -429,7 +309,7 @@ func (s Server) countLiteralFiles(query string, args map[string]any) (map[string
 		IncludeTmp:      boolArg(args, "includeTmp", false),
 		IncludeLines:    false,
 		IncludeSnippets: false,
-		Limit:           intArg(args, "limit", 100),
+		Limit:           limit,
 	})
 	if err != nil {
 		return nil, err
@@ -438,17 +318,23 @@ func (s Server) countLiteralFiles(query string, args map[string]any) (map[string
 	for _, file := range result.Files {
 		paths = append(paths, file.Path)
 	}
+	maxItems := maxItemsArg(args, defaultMaxItems)
+	paths, pathTruncated := limitSlice(paths, maxItems)
 	return map[string]any{
 		"query":        result.Query,
 		"uniqueFiles":  result.UniqueFiles,
 		"totalMatches": result.TotalMatches,
 		"counts":       result.Counts,
 		"files":        paths,
-		"truncated":    result.Truncated,
+		"truncated":    result.Truncated || pathTruncated,
+		"detail":       detailArg(args),
 	}, nil
 }
 
 func (s Server) findEnvUsages(envName string, args map[string]any) (map[string]any, error) {
+	detail := detailArg(args)
+	includeLines := detail == "lines" || boolArg(args, "lines", false)
+	includeSnippets := detail == "lines" || boolArg(args, "snippets", false)
 	search, err := searchLiteralFiles(s.Repo, envName, literalSearchOptions{
 		IncludeTests:    boolArg(args, "includeTests", false),
 		IncludeDocs:     false,
@@ -456,10 +342,10 @@ func (s Server) findEnvUsages(envName string, args map[string]any) (map[string]a
 		IncludeScripts:  boolArg(args, "includeScripts", true),
 		IncludeHidden:   boolArg(args, "includeHidden", false),
 		IncludeTmp:      boolArg(args, "includeTmp", false),
-		IncludeLines:    boolArg(args, "lines", false),
-		IncludeSnippets: boolArg(args, "snippets", false),
-		MatchesPerFile:  intArg(args, "matchesPerFile", 20),
-		Limit:           intArg(args, "limit", 100),
+		IncludeLines:    includeLines,
+		IncludeSnippets: includeSnippets,
+		MatchesPerFile:  intArg(args, "matchesPerFile", 5),
+		Limit:           intArg(args, "limit", 40),
 	})
 	if err != nil {
 		return nil, err
@@ -472,18 +358,25 @@ func (s Server) findEnvUsages(envName string, args map[string]any) (map[string]a
 			continue
 		}
 		entry := map[string]any{"path": file.Path, "category": file.Category, "readCount": readCount}
-		matches := filterMatchesByKind(file.Matches, "runtime_env_read")
-		if len(matches) > 0 {
-			entry["matches"] = matches
+		if includeLines {
+			matches := filterMatchesByKind(file.Matches, "runtime_env_read")
+			if len(matches) > 0 {
+				entry["matches"] = matches
+			}
 		}
 		files = append(files, entry)
 		totalReads += readCount
 	}
+	uniqueFiles := len(files)
+	maxItems := maxItemsArg(args, defaultMaxItems)
+	files, truncated := limitSlice(files, maxItems)
 	return map[string]any{
 		"envName":          envName,
-		"uniqueFiles":      len(files),
+		"uniqueFiles":      uniqueFiles,
 		"runtimeReadCount": totalReads,
 		"files":            files,
+		"truncated":        search.Truncated || truncated,
+		"detail":           detail,
 	}, nil
 }
 
@@ -509,6 +402,13 @@ func filterMatchesByKind(matches []literalLineMatch, kind string) []literalLineM
 }
 
 func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind string, args map[string]any) (map[string]any, error) {
+	detail := detailArg(args)
+	includeLines := detail == "lines" || boolArg(args, "lines", false)
+	includeSnippets := detail == "lines" || boolArg(args, "snippets", false)
+	perBucket := maxItemsArg(args, defaultMaxItems)
+	if detail == "summary" {
+		perBucket = min(perBucket, 10)
+	}
 	search, err := searchLiteralFiles(s.Repo, oldName, literalSearchOptions{
 		IncludeTests:    true,
 		IncludeDocs:     true,
@@ -516,10 +416,10 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 		IncludeScripts:  true,
 		IncludeHidden:   boolArg(args, "includeHidden", true),
 		IncludeTmp:      boolArg(args, "includeTmp", false),
-		IncludeLines:    boolArg(args, "lines", false),
-		IncludeSnippets: boolArg(args, "snippets", false),
-		MatchesPerFile:  intArg(args, "matchesPerFile", 6),
-		Limit:           intArg(args, "limit", 200),
+		IncludeLines:    includeLines,
+		IncludeSnippets: includeSnippets,
+		MatchesPerFile:  intArg(args, "matchesPerFile", 4),
+		Limit:           intArg(args, "limit", 40),
 	})
 	if err != nil {
 		return nil, err
@@ -532,42 +432,64 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 		"docs":         {},
 		"other":        {},
 	}
+	bucketTotals := map[string]int{}
 	relationPaths := []string{}
+	truncated := search.Truncated
 	for _, file := range search.Files {
 		entry := map[string]any{"path": file.Path, "matchCount": file.MatchCount}
-		if len(file.Matches) > 0 {
+		if includeLines && len(file.Matches) > 0 {
 			entry["matches"] = file.Matches
 		}
 		bucket := renameBucket(file)
-		filesByBucket[bucket] = append(filesByBucket[bucket], entry)
+		bucketTotals[bucket]++
+		if len(filesByBucket[bucket]) < perBucket {
+			filesByBucket[bucket] = append(filesByBucket[bucket], entry)
+		} else {
+			truncated = true
+		}
 		if bucket == "runtimeReads" || bucket == "scripts" {
 			relationPaths = append(relationPaths, file.Path)
 		}
 	}
-	relationSummary := map[string]any{"files": []map[string]any{}}
-	if boolArg(args, "includeGraph", true) && len(relationPaths) > 0 {
-		relationSummary, err = s.Query.FileRelationSummary(ctx, relationPaths, intArg(args, "relationExamples", 5))
-		if err != nil {
-			return nil, err
-		}
+	// Convert to map[string]any so the compact formatter can nest list sections
+	// (typed map[string][]map[string]any falls through to Go %v dumps).
+	filesToChange := map[string]any{}
+	for bucket, files := range filesByBucket {
+		filesToChange[bucket] = files
 	}
-	return map[string]any{
+	response := map[string]any{
 		"oldName":       oldName,
 		"kind":          kind,
 		"uniqueFiles":   search.UniqueFiles,
 		"totalMatches":  search.TotalMatches,
 		"counts":        search.Counts,
-		"filesToChange": filesByBucket,
-		"graphSummary":  relationSummary,
+		"bucketTotals":  bucketTotals,
+		"filesToChange": filesToChange,
 		"external":      externalRenameNotes(kind),
-		"truncated":     search.Truncated,
-	}, nil
+		"truncated":     truncated,
+		"detail":        detail,
+	}
+	if boolArg(args, "includeGraph", false) && len(relationPaths) > 0 {
+		relationSummary, err := s.Query.FileRelationSummary(ctx, relationPaths, intArg(args, "relationExamples", 3))
+		if err != nil {
+			return nil, err
+		}
+		response["graphSummary"] = relationSummary
+	}
+	return response, nil
 }
 
 func (s Server) analyzeFunctionImpact(ctx context.Context, symbol string, args map[string]any) (map[string]any, error) {
+	detail := detailArg(args)
 	includeTests := boolArg(args, "includeTests", true)
 	includeScripts := boolArg(args, "includeScripts", true)
 	includeTmp := boolArg(args, "includeTmp", false)
+	includeLines := detail == "lines" || boolArg(args, "lines", false)
+	includeSnippets := detail == "lines" || boolArg(args, "snippets", false)
+	listLimit := maxItemsArg(args, defaultMaxItems)
+	if detail == "summary" {
+		listLimit = min(listLimit, 15)
+	}
 	impact, err := analyzeFunctionImpact(s.Repo, symbol, functionImpactOptions{
 		IncludeTests:    includeTests,
 		IncludeDocs:     boolArg(args, "includeDocs", false),
@@ -575,50 +497,78 @@ func (s Server) analyzeFunctionImpact(ctx context.Context, symbol string, args m
 		IncludeScripts:  includeScripts,
 		IncludeHidden:   boolArg(args, "includeHidden", false),
 		IncludeTmp:      includeTmp,
-		IncludeLines:    boolArg(args, "lines", false),
-		IncludeSnippets: boolArg(args, "snippets", false),
-		MatchesPerFile:  intArg(args, "matchesPerFile", 5),
-		Limit:           intArg(args, "limit", 100),
+		IncludeLines:    includeLines,
+		IncludeSnippets: includeSnippets,
+		MatchesPerFile:  intArg(args, "matchesPerFile", 3),
+		Limit:           intArg(args, "limit", 40),
 	})
 	if err != nil {
 		return nil, err
 	}
-	graphPaths := pathsForFunctionGraph(impact)
-	graphSummary := map[string]any{"files": []map[string]any{}}
-	if boolArg(args, "includeGraph", true) && len(graphPaths) > 0 {
-		graphSummary, err = s.Query.FileRelationSummary(ctx, graphPaths, intArg(args, "relationExamples", 5))
-		if err != nil {
-			return nil, err
+	defs, defTrunc := limitSlice(compactFunctionMatches(impact.Definitions), listLimit)
+	imports, importTrunc := limitSlice(compactFunctionMatches(impact.Imports), listLimit)
+	calls, callTrunc := limitSlice(compactFunctionMatches(impact.CallSites), listLimit)
+	refs, refTrunc := limitSlice(compactFunctionMatches(impact.References), min(listLimit, 10))
+	truncated := impact.Truncated || defTrunc || importTrunc || callTrunc || refTrunc
+
+	response := map[string]any{
+		"symbol":      symbol,
+		"uniqueFiles": impact.UniqueFiles,
+		"totalHits":   impact.TotalHits,
+		"counts":      impact.Counts,
+		"definitions": defs,
+		"callSites":   calls,
+		"truncated":   truncated,
+		"detail":      detail,
+	}
+	if detail == "summary" {
+		response["importFiles"] = len(impact.Imports)
+		response["referenceFiles"] = len(impact.References)
+		if len(imports) > 0 {
+			response["imports"] = imports
+		}
+	} else {
+		response["imports"] = imports
+		response["references"] = refs
+	}
+
+	// Transitive expansion is expensive; off by default.
+	transitiveDepth := intArg(args, "transitiveDepth", 0)
+	if transitiveDepth > 0 {
+		response["transitive"] = s.transitiveFunctionImpact(symbol, impact, transitiveDepth, intArg(args, "maxTransitiveSymbols", 4), includeTests, includeScripts, includeTmp)
+	}
+	if boolArg(args, "includeGraph", false) {
+		graphPaths := pathsForFunctionGraph(impact)
+		if len(graphPaths) > 0 {
+			graphSummary, err := s.Query.FileRelationSummary(ctx, graphPaths, intArg(args, "relationExamples", 3))
+			if err != nil {
+				return nil, err
+			}
+			response["graphSummary"] = graphSummary
 		}
 	}
-	return map[string]any{
-		"symbol":       symbol,
-		"uniqueFiles":  impact.UniqueFiles,
-		"totalHits":    impact.TotalHits,
-		"counts":       impact.Counts,
-		"definitions":  compactFunctionMatches(impact.Definitions),
-		"imports":      compactFunctionMatches(impact.Imports),
-		"callSites":    compactFunctionMatches(impact.CallSites),
-		"references":   compactFunctionMatches(impact.References),
-		"transitive":   s.transitiveFunctionImpact(symbol, impact, intArg(args, "transitiveDepth", 1), intArg(args, "maxTransitiveSymbols", 8), includeTests, includeScripts, includeTmp),
-		"graphSummary": graphSummary,
-		"truncated":    impact.Truncated,
-	}, nil
+	return response, nil
 }
 
 func (s Server) analyzeCallsiteContract(callee string, requiredBeforeCall string, args map[string]any) (map[string]any, error) {
-	resultLimit := intArg(args, "resultLimit", 30)
+	detail := detailArg(args)
+	resultLimit := intArg(args, "resultLimit", maxItemsArg(args, defaultMaxItems))
+	if detail == "summary" {
+		resultLimit = min(resultLimit, 15)
+	}
+	includeSnippets := detail == "lines" || boolArg(args, "snippets", false)
 	result, err := analyzeCallsiteContract(s.Repo, callee, requiredBeforeCall, callsiteContractOptions{
 		IncludeTests:    boolArg(args, "includeTests", true),
 		IncludeScripts:  boolArg(args, "includeScripts", true),
 		IncludeHidden:   boolArg(args, "includeHidden", false),
 		IncludeTmp:      boolArg(args, "includeTmp", false),
-		IncludeSnippets: boolArg(args, "snippets", false),
-		Limit:           intArg(args, "limit", 200),
+		IncludeSnippets: includeSnippets,
+		Limit:           intArg(args, "limit", 80),
 	})
 	if err != nil {
 		return nil, err
 	}
+	files, filesTrunc := limitSlice(result.Files, maxItemsArg(args, defaultMaxItems))
 	response := map[string]any{
 		"callee":                 result.Callee,
 		"requiredBeforeCall":     result.RequiredBeforeCall,
@@ -627,26 +577,37 @@ func (s Server) analyzeCallsiteContract(callee string, requiredBeforeCall string
 		"missingCallSites":       result.MissingCallSites,
 		"satisfiedCallSites":     result.SatisfiedCallSites,
 		"unownedCallSites":       result.UnownedCallSites,
-		"files":                  result.Files,
+		"files":                  files,
 		"missing":                compactCallsiteContractMatches(result.Missing, resultLimit),
-		"satisfied":              compactCallsiteContractMatches(result.Satisfied, resultLimit),
 		"implementationGuidance": callsiteContractGuidance(result),
-		"truncated":              result.Truncated,
+		"truncated":              result.Truncated || filesTrunc || len(result.Missing) > resultLimit,
+		"detail":                 detail,
 	}
-	if boolArg(args, "includeAllCallSites", false) {
+	// Satisfied sites are usually less actionable; omit in summary unless requested.
+	if detail != "summary" || boolArg(args, "includeSatisfied", false) {
+		response["satisfied"] = compactCallsiteContractMatches(result.Satisfied, resultLimit)
+	}
+	if boolArg(args, "includeAllCallSites", false) || detail == "lines" {
 		response["callSites"] = compactCallsiteContractMatches(result.CallSites, resultLimit)
 	}
 	return response, nil
 }
 
 func (s Server) prepareFeatureContext(ctx context.Context, query string, args map[string]any) (map[string]any, error) {
+	detail := detailArg(args)
 	limit := intArg(args, "limit", 12)
+	if detail == "summary" {
+		limit = min(limit, 12)
+	}
 	graphMatches := map[string]any{"nodes": []map[string]any{}}
 	var err error
 	if query != "" {
-		graphMatches, err = s.Query.Search(ctx, query, graph.Options{Limit: limit})
-		if err != nil {
-			return nil, err
+		// Graph search is optional enrichment; do not fail the whole pack if Neo4j is unavailable.
+		if s.Query.Driver != nil {
+			graphMatches, err = s.Query.Search(ctx, query, graph.Options{Limit: limit})
+			if err != nil {
+				graphMatches = map[string]any{"nodes": []map[string]any{}, "graphError": err.Error()}
+			}
 		}
 	}
 	sourceMatches, err := searchLiteralFiles(s.Repo, query, literalSearchOptions{
@@ -664,63 +625,106 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 	if err != nil {
 		return nil, err
 	}
-	paths := pathsFromFeatureContext(graphMatches, sourceMatches)
-	graphSummary := map[string]any{"files": []map[string]any{}}
-	if len(paths) > 0 {
-		graphSummary, err = s.Query.FileRelationSummary(ctx, paths, intArg(args, "relationExamples", 4))
-		if err != nil {
-			return nil, err
+	index := map[string]any{"repo": s.Repo, "ripple": s.Query.Ripple}
+	if s.Query.Driver != nil {
+		if freshness, freshErr := s.indexFreshness(ctx); freshErr == nil {
+			index = slimIndex(freshness)
+		} else {
+			index["graphError"] = freshErr.Error()
 		}
-	}
-	index, err := s.indexFreshness(ctx)
-	if err != nil {
-		return nil, err
 	}
 	symbol := firstStringArg(args, "symbol", "name")
 	if symbol == "" && isIdentifier(query) {
 		symbol = query
 	}
-	impactSummary := map[string]any{}
 	entryPoints := entryPointsFromGraph(graphMatches)
 	directChangeFiles := []map[string]any{}
 	tests := relatedTests(sourceMatches.Files)
-	blastRadius := map[string]any{}
+	var impact functionImpactResult
+	var transitive []map[string]any
 	if symbol != "" {
-		impact, err := analyzeFunctionImpact(s.Repo, symbol, functionImpactOptions{
+		impact, err = analyzeFunctionImpact(s.Repo, symbol, functionImpactOptions{
 			IncludeTests:   true,
 			IncludeScripts: true,
-			Limit:          intArg(args, "impactLimit", 80),
+			Limit:          intArg(args, "impactLimit", 40),
 		})
 		if err != nil {
 			return nil, err
 		}
-		transitiveDepth := min(intArg(args, "transitiveDepth", 1), 1)
-		maxTransitiveSymbols := min(intArg(args, "maxTransitiveSymbols", 4), 4)
-		transitive := s.transitiveFunctionImpact(symbol, impact, transitiveDepth, maxTransitiveSymbols, true, true, false)
-		impactSummary = compactFeatureImpact(impact, transitive)
+		// Transitive off by default for token/cost control.
+		transitiveDepth := intArg(args, "transitiveDepth", 0)
+		if transitiveDepth > 0 {
+			transitive = s.transitiveFunctionImpact(symbol, impact, min(transitiveDepth, 1), min(intArg(args, "maxTransitiveSymbols", 4), 4), true, true, false)
+		}
 		entryPoints = appendEntryPoints(entryPoints, impact.Definitions)
 		directChangeFiles = directChangeFilesFromImpact(impact)
 		tests = mergeTestFiles(tests, testFilesFromImpact(impact))
-		blastRadius = map[string]any{
-			"directCallSites": summarizeFunctionMatches(impact.CallSites, 12),
-			"references":      summarizeFunctionMatches(impact.References, 8),
-			"indirectOwners":  compactTransitiveOwners(transitive),
-		}
 	}
-	return map[string]any{
+
+	entryPoints, _ = limitSlice(entryPoints, 6)
+	directChangeFiles, _ = limitSlice(directChangeFiles, 10)
+	tests, _ = limitSlice(tests, 8)
+	reads := suggestedFollowUpReads(entryPoints, directChangeFiles, tests)
+
+	response := map[string]any{
 		"query":                      query,
 		"contextCompleteForPlanning": true,
+		"detail":                     detail,
 		"index":                      index,
 		"entryPoints":                entryPoints,
 		"directChangeFiles":          directChangeFiles,
 		"relatedTests":               tests,
-		"blastRadius":                blastRadius,
-		"dependencySummary":          graphSummary,
-		"sourceMatches":              compactLiteralSearch(sourceMatches),
-		"graphMatches":               compactGraphNodes(graphMatches),
-		"impactSummary":              impactSummary,
-		"suggestedFollowUpReads":     suggestedFollowUpReads(entryPoints, directChangeFiles, tests),
-	}, nil
+		"suggestedFollowUpReads":     reads,
+		"next":                       "Plan from this pack. Open only suggestedFollowUpReads when implementing. Use analyze_function_impact detail=files for fuller blast radius.",
+	}
+	if symbol != "" {
+		response["impactSummary"] = map[string]any{
+			"symbol":              impact.Symbol,
+			"uniqueFiles":         impact.UniqueFiles,
+			"totalHits":           impact.TotalHits,
+			"directCallSiteFiles": len(impact.CallSites),
+			"importFiles":         len(impact.Imports),
+			"referenceOnlyFiles":  len(impact.References),
+			"truncated":           impact.Truncated,
+		}
+		if detail != "summary" {
+			response["blastRadius"] = map[string]any{
+				"directCallSites": summarizeFunctionMatches(impact.CallSites, 12),
+				"references":      summarizeFunctionMatches(impact.References, 8),
+				"indirectOwners":  compactTransitiveOwners(transitive),
+			}
+		} else {
+			response["blastRadius"] = map[string]any{
+				"directCallSiteFiles": len(impact.CallSites),
+				"referenceFiles":      len(impact.References),
+				"topCallSites":        summarizeFunctionMatches(impact.CallSites, 8),
+			}
+		}
+	}
+	if detail != "summary" {
+		paths := pathsFromFeatureContext(graphMatches, sourceMatches)
+		if s.Query.Driver != nil && len(paths) > 0 {
+			if graphSummary, gerr := s.Query.FileRelationSummary(ctx, paths, intArg(args, "relationExamples", 3)); gerr == nil {
+				response["dependencySummary"] = graphSummary
+			}
+		}
+		response["sourceMatches"] = compactLiteralSearch(sourceMatches)
+		response["graphMatches"] = compactGraphNodes(graphMatches)
+	} else {
+		response["sourceMatchFiles"] = sourceMatches.UniqueFiles
+		response["graphMatchNodes"] = len(compactGraphNodes(graphMatches))
+	}
+	return response, nil
+}
+
+func slimIndex(index map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, key := range []string{"ripple", "repo", "language", "analysisMode", "nodes", "relationships", "localHead", "localBranch", "updatedAt"} {
+		if value, ok := index[key]; ok && value != nil {
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func entryPointsFromGraph(result map[string]any) []map[string]any {
@@ -1187,101 +1191,87 @@ func errorResponse(id any, code int, message string) map[string]any {
 }
 
 func tools() []map[string]any {
+	detailSchema := stringSchema("Response detail: summary (default, cheapest), files, lines, or raw. Prefer summary for planning.")
 	return []map[string]any{
-		tool("codegraph_help", "Explain how to use this CodeGraph MCP server, including the current ripple, available tools, argument aliases, and example investigation workflows. Call this first when unsure.", map[string]any{}, []string{}),
+		tool("codegraph_help", "Short router for CodeGraph tools. Use only when tool choice is unclear; prefer calling a task tool directly.", map[string]any{}, []string{}),
 		tool("get_ripple_info", "Return metadata and graph counts for the current ripple.", map[string]any{}, []string{}),
-		tool("get_index_freshness", "Return current ripple metadata, including repo path and index timestamps. Use before comparing graph answers with a live checkout.", map[string]any{}, []string{}),
+		tool("get_index_freshness", "Return ripple metadata, analysisMode, and local git HEAD/branch when available.", map[string]any{}, []string{}),
 		tool("list_node_types", "Return node label counts and relationship type counts for the current ripple.", map[string]any{}, []string{}),
-		tool("analyze_rename_impact", "Single-call rename impact analysis. Use this for prompts like 'if X is renamed' or 'what files need changes'. For env vars it classifies runtime reads, config, tests, docs, and compact graph relationships.", map[string]any{
-			"oldName":       stringSchema("Old name or exact literal. Aliases: query, q, text, term."),
-			"kind":          stringSchema("env, literal, symbol, path, or package. Default literal."),
-			"includeGraph":  boolSchema("Include compact graph relation summaries for runtime/script files. Default true."),
-			"includeHidden": boolSchema("Include hidden files such as .env. Default true for rename impact."),
-			"includeTmp":    boolSchema("Include tmp/ files. Default false."),
-			"limit":         intSchema("Maximum files."),
-		}, []string{"oldName"}),
-		tool("analyze_function_impact", "Single-call feature blast-radius analysis for a function, hook, component, method, or exported symbol name. Use this for prompts like 'where is X used', 'what breaks if X behavior changes', or 'where must we add a precondition before calling X'. Returns definitions, imports, call sites, tests, and compact graph relationship summaries.", map[string]any{
-			"symbol":               stringSchema("Function, hook, component, method, or symbol name. Aliases: name, query, q, text, term."),
-			"includeTests":         boolSchema("Include test files. Default true."),
-			"includeScripts":       boolSchema("Include files under scripts/. Default true."),
-			"includeGraph":         boolSchema("Include compact graph relation summaries. Default true."),
-			"includeTmp":           boolSchema("Include tmp/ files. Default false."),
-			"transitiveDepth":      intSchema("Owner-call expansion depth. Default 1."),
-			"maxTransitiveSymbols": intSchema("Maximum owner symbols to expand. Default 8."),
-			"limit":                intSchema("Maximum files."),
+		tool("prepare_feature_context", "One-call planning pack: entry points, likely edit files, tests, and compact blast radius. Default detail=summary is enough for planning; open files only when implementing.", map[string]any{
+			"query":   stringSchema("Feature term, symbol, path, or exact text. Aliases: q, feature, symbol, name, path."),
+			"symbol":  stringSchema("Optional function/hook/component name when known."),
+			"detail":  detailSchema,
+			"limit":   intSchema("Max source/graph matches. Default 12."),
+			"maxItems": intSchema("Max list items returned. Default 20."),
+		}, []string{"query"}),
+		tool("analyze_function_impact", "Blast radius for a function, hook, component, method, or exported symbol: definitions, call sites, imports. Default detail=summary. Set transitiveDepth>0 only for owner expansion.", map[string]any{
+			"symbol":          stringSchema("Symbol name. Aliases: name, query, q."),
+			"detail":          detailSchema,
+			"includeTests":    boolSchema("Include tests. Default true."),
+			"includeScripts":  boolSchema("Include scripts/. Default true."),
+			"includeGraph":    boolSchema("Include Neo4j file relation summary. Default false."),
+			"transitiveDepth": intSchema("Owner expansion depth. Default 0 (off)."),
+			"limit":           intSchema("Max files scanned. Default 40."),
+			"maxItems":        intSchema("Max list items returned. Default 20."),
 		}, []string{"symbol"}),
-		tool("analyze_callsite_contract", "Single-call call-site contract analysis. Use when a feature requires every existing call to callee X to be preceded by required check Y, for example 'before calling performAction call assertActionAllowed'. Returns missing and satisfied call sites by file, owner, and line. Leave snippets=false for planning; request snippets only when exact source text is required.", map[string]any{
-			"callee":             stringSchema("Function, hook, component, or method that is being called. Aliases: function, symbol, query, q."),
-			"requiredBeforeCall": stringSchema("Function or method that must be called earlier in the same enclosing function. Aliases: required, precheck, check."),
-			"includeTests":       boolSchema("Include test files. Default true."),
-			"includeScripts":     boolSchema("Include files under scripts/. Default true."),
-			"includeTmp":         boolSchema("Include tmp/ files. Default false."),
-			"snippets":           boolSchema("Include matching source snippets. Default false. Keep false for planning to reduce tokens."),
-			"limit":              intSchema("Maximum call sites scanned. Default 200."),
-			"resultLimit":        intSchema("Maximum call sites returned per list. Default 80."),
+		tool("analyze_rename_impact", "Rename/migration impact for an exact name (env, literal, path, package). Groups runtime/config/tests/docs/scripts.", map[string]any{
+			"oldName":      stringSchema("Old name or exact literal. Aliases: query, q."),
+			"kind":         stringSchema("env, literal, symbol, path, or package. Default literal."),
+			"detail":       detailSchema,
+			"includeGraph": boolSchema("Include Neo4j relation summary. Default false."),
+			"limit":        intSchema("Max files scanned. Default 40."),
+			"maxItems":     intSchema("Max items per bucket. Default 20."),
+		}, []string{"oldName"}),
+		tool("analyze_callsite_contract", "Find call sites of callee missing a required pre-call check in the same owner function.", map[string]any{
+			"callee":             stringSchema("Callee name. Aliases: function, symbol, query."),
+			"requiredBeforeCall": stringSchema("Required precheck name. Aliases: required, precheck, check."),
+			"detail":             detailSchema,
+			"includeTests":       boolSchema("Include tests. Default true."),
+			"limit":              intSchema("Max call sites scanned. Default 80."),
+			"resultLimit":        intSchema("Max call sites returned. Default 20."),
 		}, []string{"callee", "requiredBeforeCall"}),
-		tool("prepare_feature_context", "One-call starter context pack for feature work. Use exactly once before editing when the prompt asks for entry points, related files, tests, dependencies, index freshness, or blast radius. Treat contextCompleteForPlanning=true as enough for planning; only read files afterward when implementing or when exact source lines are required.", map[string]any{
-			"query":                stringSchema("Feature term, symbol name, file path, or exact source text. Aliases: q, feature, symbol, name, path."),
-			"symbol":               stringSchema("Optional function/hook/component/method name when known."),
-			"limit":                intSchema("Maximum source and graph matches. Default 12."),
-			"impactLimit":          intSchema("Maximum files scanned for symbol impact. Default 80."),
-			"relationExamples":     intSchema("Maximum dependency examples per file."),
-			"transitiveDepth":      intSchema("Owner-call expansion depth. Default 1."),
-			"maxTransitiveSymbols": intSchema("Maximum owner symbols to expand. Default 4."),
+		tool("count_literal_files", "Count unique files containing exact text. Returns category counts and paths.", map[string]any{
+			"query":  stringSchema("Exact text. Aliases: q, text, term."),
+			"detail": detailSchema,
+			"limit":  intSchema("Max files. Default 40."),
 		}, []string{"query"}),
-		tool("count_literal_files", "Single-call exact string count. Use this for 'how many files contain X' prompts. Returns only paths plus category counts. Defaults match normal source search: excludes hidden files and tmp/ unless explicitly included.", map[string]any{
-			"query":          stringSchema("Exact text to find. Aliases: q, text, term."),
-			"includeTests":   boolSchema("Include test files. Default true."),
-			"includeDocs":    boolSchema("Include markdown docs. Default true."),
-			"includeConfig":  boolSchema("Include config files. Default true."),
-			"includeScripts": boolSchema("Include files under scripts/. Default true."),
-			"includeHidden":  boolSchema("Include hidden files such as .env. Default false."),
-			"includeTmp":     boolSchema("Include tmp/ files. Default false."),
-			"limit":          intSchema("Maximum files."),
-		}, []string{"query"}),
-		tool("find_env_usages", "Single-call runtime env var usage search. Use this for 'which files read process.env.NAME'. Returns files and read counts. Defaults exclude tests, docs, config, hidden files, and tmp files.", map[string]any{
-			"envName":        stringSchema("Environment variable name. Aliases: name, query, q, text, term."),
-			"includeTests":   boolSchema("Include test files. Default false."),
-			"includeScripts": boolSchema("Include files under scripts/. Default true."),
-			"includeHidden":  boolSchema("Include hidden files such as .env. Default false."),
-			"includeTmp":     boolSchema("Include tmp/ files. Default false."),
-			"limit":          intSchema("Maximum files."),
+		tool("find_env_usages", "Find runtime process.env.NAME reads. Defaults exclude tests/docs/config.", map[string]any{
+			"envName": stringSchema("Env var name. Aliases: name, query, q."),
+			"detail":  detailSchema,
+			"limit":   intSchema("Max files. Default 40."),
 		}, []string{"envName"}),
-		tool("search_code", "Search all indexed code graph nodes in the current ripple. Use this first for broad terms like billing, checkout, route, package names, or paths.", map[string]any{
+		tool("search_code", "Search indexed graph nodes (files, symbols, packages, routes). Prefer high-level tools when the task matches them.", map[string]any{
 			"query": stringSchema("Search text. Aliases: q, text, term, name, path."),
-			"limit": intSchema("Maximum results."),
+			"limit": intSchema("Max results. Default 20."),
 		}, []string{"query"}),
-		tool("find_symbol", "Find symbols by name. Accepts name or query.", map[string]any{
-			"name":  stringSchema("Symbol name or partial name. Alias: query."),
-			"limit": intSchema("Maximum results."),
+		tool("find_symbol", "Find symbols by name.", map[string]any{
+			"name":  stringSchema("Symbol name. Alias: query."),
+			"limit": intSchema("Max results. Default 20."),
 		}, []string{}),
-		tool("find_file", "Find files by path. Accepts path or query.", map[string]any{
-			"path":  stringSchema("File path or partial path. Alias: query."),
-			"limit": intSchema("Maximum results."),
+		tool("find_file", "Find files by path.", map[string]any{
+			"path":  stringSchema("File path. Alias: query."),
+			"limit": intSchema("Max results. Default 20."),
 		}, []string{}),
-		tool("get_dependencies", "Get outgoing dependencies for a node id. Accepts targetId, sourceId, id, or query.", nodeIDSchema(), []string{}),
-		tool("get_dependents", "Get incoming dependents for a node id. Accepts targetId, sourceId, id, or query.", nodeIDSchema(), []string{}),
-		tool("get_relations", "Get graph relations for a node id in forward, reverse, or both directions. Direction aliases: outbound, incoming, inbound.", mapMerge(nodeIDSchema(), map[string]any{
-			"direction": stringSchema("forward, reverse, both, outbound, incoming, inbound."),
-			"depth":     intSchema("Traversal depth."),
-			"limit":     intSchema("Maximum relationship paths."),
+		tool("get_dependencies", "Outgoing dependencies for a node id (depth default 1, limit default 20).", nodeIDSchema(), []string{}),
+		tool("get_dependents", "Incoming dependents for a node id (depth default 1, limit default 20).", nodeIDSchema(), []string{}),
+		tool("get_relations", "Graph relations for a node id. Prefer depth=1 and limit<=20.", mapMerge(nodeIDSchema(), map[string]any{
+			"direction": stringSchema("forward, reverse, both, outbound, inbound."),
+			"depth":     intSchema("Traversal depth. Default 1."),
+			"limit":     intSchema("Max paths. Default 20."),
 		}), []string{}),
-		tool("get_impact", "Get reverse dependency impact for a node id.", nodeIDSchema(), []string{}),
-		tool("get_route_impact", "Get reverse route impact for a route or file node id.", nodeIDSchema(), []string{}),
-		tool("get_related_tests", "Get tests related to a node id using reverse graph relations.", nodeIDSchema(), []string{}),
-		tool("find_paths", "Find a shortest graph path between two node ids.", map[string]any{
-			"fromId": stringSchema("Start node id. Aliases: from, sourceId, startId, source."),
-			"toId":   stringSchema("End node id. Aliases: to, targetId, endId, target."),
-			"depth":  intSchema("Maximum path depth."),
+		tool("find_paths", "Shortest graph path between two node ids.", map[string]any{
+			"fromId": stringSchema("Start node id. Aliases: from, sourceId."),
+			"toId":   stringSchema("End node id. Aliases: to, targetId."),
+			"depth":  intSchema("Max path depth. Default 1."),
 		}, []string{}),
-		tool("open_symbol_body", "Open source text for a symbol id.", map[string]any{
+		tool("open_symbol_body", "Open source for a symbol id. Use only after locating the symbol.", map[string]any{
 			"symbolId":     stringSchema("Symbol id. Aliases: id, targetId, sourceId."),
-			"contextLines": intSchema("Extra lines before and after the indexed symbol range. Default 2."),
+			"contextLines": intSchema("Extra lines around the symbol. Default 2."),
 		}, []string{}),
-		tool("open_file_excerpt", "Open a source file excerpt by path.", map[string]any{
+		tool("open_file_excerpt", "Open a source excerpt by path. Default endLine is 40; keep ranges tight.", map[string]any{
 			"path":      stringSchema("File path. Aliases: file, filePath."),
-			"startLine": intSchema("Start line."),
-			"endLine":   intSchema("End line."),
+			"startLine": intSchema("Start line. Default 1."),
+			"endLine":   intSchema("End line. Default 40."),
 		}, []string{}),
 	}
 }
@@ -1371,20 +1361,36 @@ func stringArgDefault(args map[string]any, key string, fallback string) string {
 }
 
 func intArg(args map[string]any, key string, fallback int) int {
-	if value, ok := args[key].(float64); ok {
-		return int(value)
+	value, ok := args[key]
+	if !ok {
+		return fallback
 	}
-	return fallback
+	switch value.(type) {
+	case int, int32, int64, float32, float64, json.Number:
+		return intValue(value)
+	default:
+		return fallback
+	}
 }
 
 func intValue(value any) int {
 	switch typed := value.(type) {
 	case int:
 		return typed
+	case int32:
+		return int(typed)
 	case int64:
+		return int(typed)
+	case float32:
 		return int(typed)
 	case float64:
 		return int(typed)
+	case json.Number:
+		n, err := typed.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(n)
 	default:
 		return 0
 	}
