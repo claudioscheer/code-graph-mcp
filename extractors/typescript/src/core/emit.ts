@@ -5,7 +5,7 @@ export class EventBuffer {
   private readonly events: GraphEvent[] = [];
 
   add(event: GraphEvent): void {
-    const key = JSON.stringify(event);
+    const key = eventKey(event);
     if (this.seen.has(key)) return;
     this.seen.add(key);
     this.events.push(event);
@@ -24,5 +24,18 @@ export class EventBuffer {
     for (const event of this.all()) {
       process.stdout.write(`${JSON.stringify(event)}\n`);
     }
+  }
+}
+
+function eventKey(event: GraphEvent): string {
+  switch (event.type) {
+    case "node":
+      return `node\0${event.label}\0${event.id}`;
+    case "edge":
+      return `edge\0${event.rel}\0${event.from}\0${event.to}\0${JSON.stringify(event.props)}`;
+    case "warning":
+      return `warning\0${event.source}\0${event.message}\0${JSON.stringify(event.props ?? {})}`;
+    case "summary":
+      return `summary\0${event.source}\0${JSON.stringify(event.props)}`;
   }
 }

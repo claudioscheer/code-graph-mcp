@@ -2,25 +2,28 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 type literalSearchOptions struct {
-	IncludeTests    bool
-	IncludeDocs     bool
-	IncludeConfig   bool
-	IncludeScripts  bool
-	IncludeHidden   bool
-	IncludeTmp      bool
-	IncludeLines    bool
-	IncludeSnippets bool
-	MatchesPerFile  int
-	Limit           int
+	IncludeTests     bool
+	IncludeDocs      bool
+	IncludeConfig    bool
+	IncludeScripts   bool
+	IncludeHidden    bool
+	IncludeTmp       bool
+	IncludeLines     bool
+	IncludeSnippets  bool
+	MatchesPerFile   int
+	Limit            int
+	CandidateTimeout time.Duration
 }
 
 type literalFileMatch struct {
@@ -149,7 +152,7 @@ func searchLiteralFiles(repo string, query string, opts literalSearchOptions) (l
 		}
 		return nil
 	}
-	if candidates, ok, err := candidateFiles(repo, query, opts.IncludeHidden, opts.IncludeTmp); err != nil {
+	if candidates, ok, err := candidateFiles(repo, query, opts.IncludeHidden, opts.IncludeTmp, opts.CandidateTimeout); err != nil {
 		return result, err
 	} else if ok {
 		for _, rel := range candidates {
@@ -253,7 +256,7 @@ func analyzeFunctionImpact(repo string, symbol string, opts functionImpactOption
 		}
 		return nil
 	}
-	if candidates, ok, err := candidateFiles(repo, symbol, opts.IncludeHidden, opts.IncludeTmp); err != nil {
+	if candidates, ok, err := candidateFiles(repo, symbol, opts.IncludeHidden, opts.IncludeTmp, 0); err != nil {
 		return result, err
 	} else if ok {
 		for _, rel := range candidates {
@@ -372,7 +375,7 @@ func analyzeCallsiteContract(repo string, callee string, requiredBeforeCall stri
 		}
 		return nil
 	}
-	if candidates, ok, err := candidateFiles(repo, callee, opts.IncludeHidden, opts.IncludeTmp); err != nil {
+	if candidates, ok, err := candidateFiles(repo, callee, opts.IncludeHidden, opts.IncludeTmp, 0); err != nil {
 		return result, err
 	} else if ok {
 		for _, rel := range candidates {
@@ -438,7 +441,7 @@ func completeCallsiteContract(result *callsiteContractResult) {
 	sortCallsiteContractMatches(result.Satisfied)
 }
 
-func candidateFiles(repo string, query string, includeHidden bool, includeTmp bool) ([]string, bool, error) {
+func candidateFiles(repo string, query string, includeHidden bool, includeTmp bool, timeout time.Duration) ([]string, bool, error) {
 	args := []string{"--files-with-matches", "--fixed-strings", "--no-messages"}
 	if includeHidden {
 		args = append(args, "--hidden", "--no-ignore")
@@ -465,8 +468,17 @@ func candidateFiles(repo string, query string, includeHidden bool, includeTmp bo
 		args = append(args, "--glob", "!tmp/**")
 	}
 	args = append(args, "--", query, repo)
-	cmd := exec.Command("rg", args...)
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, "rg", args...)
 	output, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return []string{}, true, nil
+	}
 	if err != nil {
 		if _, ok := err.(*exec.ExitError); ok {
 			return []string{}, true, nil

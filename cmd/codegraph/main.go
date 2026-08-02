@@ -62,6 +62,7 @@ func run(ctx context.Context, args []string) error {
 		repo := fs.String("repo", cfg.Repo, "repo root")
 		ripple := fs.String("ripple", "", "ripple name")
 		language := fs.String("language", "typescript", "language")
+		analysisMode := fs.String("analysis-mode", "fast", "analysis mode: full or fast")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -70,6 +71,10 @@ func run(ctx context.Context, args []string) error {
 		}
 		if *language != "typescript" {
 			return errors.New("only typescript is supported in v1")
+		}
+		mode, err := parseAnalysisMode(*analysisMode)
+		if err != nil {
+			return err
 		}
 		repoPath, err := filepath.Abs(*repo)
 		if err != nil {
@@ -83,17 +88,18 @@ func run(ctx context.Context, args []string) error {
 		if err := store.ResetRipple(ctx, *ripple); err != nil {
 			return err
 		}
-		if err := store.SaveRipple(ctx, neo4jstore.Ripple{Name: *ripple, Repo: repoPath, Language: *language}); err != nil {
+		if err := store.SaveRipple(ctx, neo4jstore.Ripple{Name: *ripple, Repo: repoPath, Language: *language, AnalysisMode: mode}); err != nil {
 			return err
 		}
 		plugin := typescriptPlugin(cfg)
-		if err := (plugins.Runner{Stderr: os.Stderr}).Run(ctx, plugin, plugins.ExtractRequest{Repo: repoPath, Protocol: events.Protocol}, store.ForRipple(*ripple)); err != nil {
+		if err := (plugins.Runner{Stderr: os.Stderr}).Run(ctx, plugin, plugins.ExtractRequest{Repo: repoPath, Protocol: events.Protocol, AnalysisMode: mode}, store.ForRipple(*ripple)); err != nil {
 			return err
 		}
 		return writeJSON(map[string]string{"status": "indexed", "ripple": *ripple, "repo": repoPath})
 	case "update":
 		fs := flag.NewFlagSet("update", flag.ContinueOnError)
 		ripple := fs.String("ripple", "", "ripple name")
+		analysisMode := fs.String("analysis-mode", "", "analysis mode override: full or fast")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -112,13 +118,21 @@ func run(ctx context.Context, args []string) error {
 		if info.Language != "typescript" {
 			return fmt.Errorf("only typescript is supported in v1, ripple %q uses %q", *ripple, info.Language)
 		}
+		if *analysisMode != "" {
+			mode, err := parseAnalysisMode(*analysisMode)
+			if err != nil {
+				return err
+			}
+			info.AnalysisMode = mode
+		}
+		info.AnalysisMode = neo4jstore.NormalizeAnalysisMode(info.AnalysisMode)
 		if err := store.ResetRipple(ctx, *ripple); err != nil {
 			return err
 		}
 		if err := store.SaveRipple(ctx, info); err != nil {
 			return err
 		}
-		if err := (plugins.Runner{Stderr: os.Stderr}).Run(ctx, typescriptPlugin(cfg), plugins.ExtractRequest{Repo: info.Repo, Protocol: events.Protocol}, store.ForRipple(*ripple)); err != nil {
+		if err := (plugins.Runner{Stderr: os.Stderr}).Run(ctx, typescriptPlugin(cfg), plugins.ExtractRequest{Repo: info.Repo, Protocol: events.Protocol, AnalysisMode: info.AnalysisMode}, store.ForRipple(*ripple)); err != nil {
 			return err
 		}
 		return writeJSON(map[string]string{"status": "updated", "ripple": *ripple, "repo": info.Repo})
@@ -199,7 +213,7 @@ func run(ctx context.Context, args []string) error {
 		if len(args) < 2 || args[1] != "typescript" {
 			return errors.New("usage: codegraph test-extractor typescript")
 		}
-		return (plugins.Runner{Stderr: os.Stderr}).Run(ctx, typescriptPlugin(cfg), plugins.ExtractRequest{Repo: "testdata/fixtures/typescript/next-app", Protocol: events.Protocol}, discardSink{})
+		return (plugins.Runner{Stderr: os.Stderr}).Run(ctx, typescriptPlugin(cfg), plugins.ExtractRequest{Repo: "testdata/fixtures/typescript/next-app", Protocol: events.Protocol, AnalysisMode: "full"}, discardSink{})
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[0])
@@ -289,6 +303,17 @@ func typescriptPlugin(cfg config.Config) plugins.ExtractorPlugin {
 		}
 	}
 	return plugins.ExtractorPlugin{Name: "typescript", Language: "typescript", Command: cfg.TSExtractor, Env: map[string]string{"NODE_OPTIONS": cfg.NodeOptions}}
+}
+
+func parseAnalysisMode(mode string) (string, error) {
+	switch mode {
+	case "", "fast":
+		return "fast", nil
+	case "full":
+		return "full", nil
+	default:
+		return "", fmt.Errorf("unsupported analysis mode %q; expected full or fast", mode)
+	}
 }
 
 func doctor(ctx context.Context, cfg config.Config) error {

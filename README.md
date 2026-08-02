@@ -55,13 +55,17 @@ Neo4j Browser is available at `http://localhost:7474` with `neo4j/password`.
 
 The TypeScript extractor respects root and nested `.gitignore` files before adding files to the graph. Built-in ignores still exclude generated/vendor paths such as `node_modules`, `.git`, `.next`, `dist`, `build`, coverage folders, and `.d.ts` files.
 
-For large repositories, the extractor stays bounded by using lightweight relative import resolution, skipping full symbol relationship traversal, skipping dependency-cruiser validation, and omitting symbol signatures. These limits are configurable:
+By default, indexing uses `--analysis-mode fast`. Fast mode stays bounded by using lightweight relative import resolution, skipping full symbol relationship traversal above the configured file limit, skipping dependency-cruiser validation above its configured file limit, and omitting symbol signatures. These limits are configurable:
 
 ```bash
 CODEGRAPH_NODE_OPTIONS=--max-old-space-size=6144
 CODEGRAPH_SYMBOL_RELATION_LIMIT=750
+CODEGRAPH_FORCE_SYMBOL_RELATIONSHIPS=false
 CODEGRAPH_DEPCRUISE_FILE_LIMIT=1500
+CODEGRAPH_IDENTIFIER_REFERENCES=false
 ```
+
+Use `--analysis-mode full` when CodeGraph needs richer TypeScript resolution and symbol signatures. Full mode is still static analysis. It cannot prove runtime-only relations created through dynamic imports, computed property access, dependency injection containers, generated code that is not checked in, or framework behavior that only exists at runtime. Symbol relationship traversal remains guarded by `CODEGRAPH_SYMBOL_RELATION_LIMIT` because that pass is too memory-heavy on large repositories; set `CODEGRAPH_FORCE_SYMBOL_RELATIONSHIPS=true` only for smaller repos, higher-memory runs, or targeted debugging. Raw identifier references are also disabled by default; set `CODEGRAPH_IDENTIFIER_REFERENCES=true` only when forced symbol relationships are already safe.
 
 ## Commands
 
@@ -69,7 +73,7 @@ CODEGRAPH_DEPCRUISE_FILE_LIMIT=1500
 - `codegraph reset`: deletes all graph data and ripples from Neo4j.
 - `codegraph discover --repo .`: detects package manager, workspaces, and project types.
 - `codegraph index --ripple my-app --repo . --language typescript`: creates or replaces a named ripple index for a repo.
-- `codegraph update --ripple my-app`: re-indexes an existing ripple using its saved repo and language.
+- `codegraph update --ripple my-app`: re-indexes an existing ripple using its saved repo, language, and analysis mode.
 - `codegraph status --ripple my-app`: shows node and relationship counts for one ripple.
 - `codegraph ripples`: lists all indexed ripples in the database.
 - `codegraph visualize --ripple my-app --output graph.html`: exports an HTML graph viewer for one ripple.

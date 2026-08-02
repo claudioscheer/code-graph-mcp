@@ -17,8 +17,9 @@ type EventSink interface {
 }
 
 type ExtractRequest struct {
-	Repo     string
-	Protocol string
+	Repo         string
+	Protocol     string
+	AnalysisMode string
 }
 
 type ExtractorPlugin struct {
@@ -36,6 +37,9 @@ type Runner struct {
 func (r Runner) Run(ctx context.Context, plugin ExtractorPlugin, req ExtractRequest, sink EventSink) error {
 	args := append([]string{}, plugin.Args...)
 	args = append(args, "--repo", req.Repo, "--protocol", req.Protocol)
+	if req.AnalysisMode != "" {
+		args = append(args, "--analysis-mode", req.AnalysisMode)
+	}
 	cmd := exec.CommandContext(ctx, plugin.Command, args...)
 	cmd.Env = os.Environ()
 	for key, value := range plugin.Env {

@@ -53,7 +53,7 @@ func (s Service) Metadata(ctx context.Context) (map[string]any, error) {
 			RETURN count(r) AS relationships
 		}
 		OPTIONAL MATCH (ripple:Ripple {name: $ripple})
-		RETURN nodes, relationships, ripple.repo AS repo, ripple.language AS language, ripple.createdAt AS createdAt, ripple.updatedAt AS updatedAt
+		RETURN nodes, relationships, ripple.repo AS repo, ripple.language AS language, coalesce(ripple.analysisMode, "full") AS analysisMode, ripple.createdAt AS createdAt, ripple.updatedAt AS updatedAt
 	`, map[string]any{"ripple": s.Ripple}, neo4j.EagerResultTransformer)
 	if err != nil {
 		return nil, err
@@ -115,6 +115,22 @@ func (s Service) FindFile(ctx context.Context, path string, opts Options) (map[s
 		ORDER BY n.path, n.id
 		LIMIT $limit
 	`, map[string]any{"path": path, "ripple": s.Ripple, "limit": opts.Limit + 1}, opts.Limit)
+}
+
+func (s Service) Node(ctx context.Context, id string) (map[string]any, error) {
+	result, err := neo4j.ExecuteQuery(ctx, s.Driver, `
+		MATCH (n:GraphNode {ripple: $ripple})
+		WHERE n.id = $id OR n.sourceId = $sourceId
+		RETURN n AS node
+		LIMIT 1
+	`, map[string]any{"id": s.scopedID(id), "sourceId": unscopedID(s.Ripple, id), "ripple": s.Ripple}, neo4j.EagerResultTransformer)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Records) == 0 {
+		return nil, fmt.Errorf("node %q not found", id)
+	}
+	return nodeMap(result.Records[0].AsMap()["node"].(neo4j.Node)), nil
 }
 
 func (s Service) Relations(ctx context.Context, targetID string, opts Options) (map[string]any, error) {
@@ -207,6 +223,13 @@ func (s Service) scopedID(id string) string {
 		return id
 	}
 	return s.Ripple + ":" + id
+}
+
+func unscopedID(ripple string, id string) string {
+	if ripple == "" {
+		return id
+	}
+	return strings.TrimPrefix(id, ripple+":")
 }
 
 func normalize(opts Options) Options {

@@ -1,6 +1,7 @@
-import { getSession } from "../../../../../packages/auth/src/session";
+import { getSession, SESSION_TTL_MS } from "../../../../../packages/auth/src/session";
 
 export default async function DashboardPage() {
   const session = await getSession();
-  return <div>{session.user.name}</div>;
+  const fallback = await getSession();
+  return <div data-ttl={SESSION_TTL_MS}>{session.user.name || fallback.user.name}</div>;
 }

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/claudioscheer/code-graph-mcp/internal/graph"
 )
@@ -143,22 +144,18 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 		if s.Query.Ripple != "" {
 			symbolID = strings.TrimPrefix(symbolID, s.Query.Ripple+":")
 		}
-		file, _, ok := strings.Cut(strings.TrimPrefix(symbolID, "symbol:"), "#")
-		if !ok {
-			return nil, fmt.Errorf("symbolId must be symbol:<path>#<name>")
-		}
-		result, err = s.openFile(file, 1, 200)
+		result, err = s.openSymbolBody(ctx, symbolID, intArg(args, "contextLines", 2))
 	default:
 		err = fmt.Errorf("unknown tool %s", params.Name)
 	}
 	if err != nil {
 		return nil, err
 	}
-	text, err := json.MarshalIndent(result, "", "  ")
+	text, err := formatToolResult(params.Name, result, args)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"content": []map[string]any{{"type": "text", "text": string(text)}}}, nil
+	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}, nil
 }
 
 func (s Server) help() map[string]any {
@@ -166,6 +163,13 @@ func (s Server) help() map[string]any {
 		"purpose": "CodeGraph MCP helps investigate an indexed codebase by searching files, symbols, packages, routes, tests, and graph relationships inside the selected ripple.",
 		"ripple":  s.Query.Ripple,
 		"repo":    s.Repo,
+		"relationCoverage": []string{
+			"Indexes all statically resolvable relations when the ripple was built with analysisMode=full.",
+			"Fast-mode ripples may intentionally omit symbol-level call/type/render relations on large repos.",
+			"Raw identifier reference extraction is disabled by default because it is memory-heavy on large repos.",
+			"Runtime-only dynamic relations are outside static graph guarantees.",
+			"Call get_index_freshness to inspect the current ripple analysisMode before treating graph relations as complete.",
+		},
 		"howToChoose": []string{
 			"Need starter context before feature work: use prepare_feature_context first.",
 			"Need every call site for a function, hook, component, method, or exported symbol: use analyze_function_impact.",
@@ -271,6 +275,8 @@ func (s Server) help() map[string]any {
 			},
 		},
 		"outputGuidance": []string{
+			"Tool results default to compact text to reduce token usage.",
+			"Use raw=true or format=json only when structured JSON is required for debugging or automation.",
 			"Prefer high-level summary fields over opening files when answering planning questions.",
 			"Use snippets=false unless exact source text is required; snippets increase token usage.",
 			"Report truncation when present and rerun with higher limits only if it changes the answer.",
@@ -348,6 +354,43 @@ func (s Server) openFile(path string, start int, end int) (map[string]any, error
 		end = len(lines)
 	}
 	return map[string]any{"path": path, "startLine": start, "endLine": end, "text": strings.Join(lines[start-1:end], "\n")}, nil
+}
+
+func (s Server) openSymbolBody(ctx context.Context, symbolID string, contextLines int) (map[string]any, error) {
+	if symbolID == "" {
+		return nil, fmt.Errorf("symbolId is required")
+	}
+	node, err := s.Query.Node(ctx, symbolID)
+	if err != nil {
+		return nil, err
+	}
+	path := firstAnyString(node, "filePath", "path")
+	if path == "" {
+		file, _, ok := strings.Cut(strings.TrimPrefix(symbolID, "symbol:"), "#")
+		if !ok {
+			return nil, fmt.Errorf("symbolId must be symbol:<path>#<name>")
+		}
+		path = file
+	}
+	start := intValue(node["startLine"])
+	end := intValue(node["endLine"])
+	if start == 0 {
+		start = 1
+	}
+	if end == 0 {
+		end = start
+	}
+	if contextLines < 0 {
+		contextLines = 0
+	}
+	body, err := s.openFile(path, start-contextLines, end+contextLines)
+	if err != nil {
+		return nil, err
+	}
+	body["symbolId"] = firstAnyString(node, "sourceId", "id")
+	body["symbolName"] = firstAnyString(node, "name")
+	body["symbolKind"] = firstAnyString(node, "kind")
+	return body, nil
 }
 
 func (s Server) searchLiteral(query string, args map[string]any) (map[string]any, error) {
@@ -607,15 +650,16 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 		}
 	}
 	sourceMatches, err := searchLiteralFiles(s.Repo, query, literalSearchOptions{
-		IncludeTests:    true,
-		IncludeDocs:     true,
-		IncludeConfig:   true,
-		IncludeScripts:  true,
-		IncludeHidden:   false,
-		IncludeTmp:      false,
-		IncludeLines:    false,
-		IncludeSnippets: false,
-		Limit:           limit,
+		IncludeTests:     true,
+		IncludeDocs:      true,
+		IncludeConfig:    true,
+		IncludeScripts:   true,
+		IncludeHidden:    false,
+		IncludeTmp:       false,
+		IncludeLines:     false,
+		IncludeSnippets:  false,
+		Limit:            limit,
+		CandidateTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		return nil, err
@@ -1231,7 +1275,8 @@ func tools() []map[string]any {
 			"depth":  intSchema("Maximum path depth."),
 		}, []string{}),
 		tool("open_symbol_body", "Open source text for a symbol id.", map[string]any{
-			"symbolId": stringSchema("Symbol id. Aliases: id, targetId, sourceId."),
+			"symbolId":     stringSchema("Symbol id. Aliases: id, targetId, sourceId."),
+			"contextLines": intSchema("Extra lines before and after the indexed symbol range. Default 2."),
 		}, []string{}),
 		tool("open_file_excerpt", "Open a source file excerpt by path.", map[string]any{
 			"path":      stringSchema("File path. Aliases: file, filePath."),
@@ -1330,6 +1375,19 @@ func intArg(args map[string]any, key string, fallback int) int {
 		return int(value)
 	}
 	return fallback
+}
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
 }
 
 func boolArg(args map[string]any, key string, fallback bool) bool {

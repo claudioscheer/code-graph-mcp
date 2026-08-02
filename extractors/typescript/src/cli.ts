@@ -24,6 +24,8 @@ async function main(): Promise<void> {
   const events = new EventBuffer();
   const symbolRelationshipLimit = intEnv("CODEGRAPH_SYMBOL_RELATION_LIMIT", 750);
   const dependencyCruiserLimit = intEnv("CODEGRAPH_DEPCRUISE_FILE_LIMIT", 1500);
+  const fullAnalysis = args.analysisMode === "full";
+  const forceSymbolRelationships = boolEnv("CODEGRAPH_FORCE_SYMBOL_RELATIONSHIPS", false);
   const phase = phaseLogger(started);
 
   phase("gitignore:start");
@@ -40,17 +42,17 @@ async function main(): Promise<void> {
   phase("project:done", { files: files.length });
 
   phase("imports:start");
-  const richResolution = files.length <= symbolRelationshipLimit;
+  const richResolution = fullAnalysis || files.length <= symbolRelationshipLimit;
   extractImports(args.repo, files, packages, events, { richResolution });
-  phase("imports:done", { richResolution });
+  phase("imports:done", { richResolution, analysisMode: args.analysisMode });
 
   phase("symbols:start");
   const symbolIndex = extractSymbols(args.repo, files, events, { includeSignature: richResolution });
   phase("symbols:done", { symbols: symbolIndex.size, includeSignature: richResolution });
 
-  if (files.length <= symbolRelationshipLimit) {
-    phase("symbol-relationships:start", { limit: symbolRelationshipLimit });
-    extractSymbolRelationships(args.repo, files, symbolIndex, events);
+  if (files.length <= symbolRelationshipLimit || forceSymbolRelationships) {
+    phase("symbol-relationships:start", { limit: symbolRelationshipLimit, forced: forceSymbolRelationships });
+    extractSymbolRelationships(args.repo, files, symbolIndex, events, { includeIdentifierReferences: boolEnv("CODEGRAPH_IDENTIFIER_REFERENCES", false) });
     phase("symbol-relationships:done");
   } else {
     events.add(warning("symbol relationship extraction skipped for large repo", { files: files.length, limit: symbolRelationshipLimit }));
@@ -92,6 +94,12 @@ function intEnv(name: string, fallback: number): number {
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return raw === "1" || raw === "true";
 }
 
 function phaseLogger(started: number): (name: string, props?: Record<string, unknown>) => void {

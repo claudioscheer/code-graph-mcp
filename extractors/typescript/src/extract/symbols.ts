@@ -1,4 +1,4 @@
-import { Node, SourceFile } from "ts-morph";
+import { Node, ParameterDeclaration, SourceFile } from "ts-morph";
 import { edge, node, stableConfigId, stableSymbolId } from "../core/events.js";
 import type { EventBuffer } from "../core/emit.js";
 import { relativePath } from "../core/fs.js";
@@ -8,6 +8,10 @@ export type SymbolIndex = Map<string, string>;
 
 export type SymbolOptions = {
   includeSignature: boolean;
+};
+
+export type SymbolRelationshipOptions = {
+  includeIdentifierReferences: boolean;
 };
 
 export function extractSymbols(repo: string, files: FileInfo[], events: EventBuffer, options: SymbolOptions = { includeSignature: true }): SymbolIndex {
@@ -30,7 +34,9 @@ export function extractSymbols(repo: string, files: FileInfo[], events: EventBuf
           startLine: declaration.getStartLineNumber(),
           endLine: declaration.getEndLineNumber(),
           exported: isExported(declaration),
+          scope: symbolScope(declaration),
           signature: options.includeSignature ? declaration.getText().split("\n")[0]?.trim() : undefined,
+          code: options.includeSignature ? declarationCode(declaration) : undefined,
           confidence: 1,
         }),
       );
@@ -38,42 +44,58 @@ export function extractSymbols(repo: string, files: FileInfo[], events: EventBuf
       if (isExported(declaration)) {
         events.add(edge("EXPORTS_SYMBOL", file.id, id, meta(file.path, declaration.getStartLineNumber(), declaration.getEndLineNumber(), "typescript_exported_symbol", 1)));
       }
+      emitParameters(file, declaration, id, byDeclaration, events, options);
+      if (Node.isVariableDeclaration(declaration)) {
+        const initializer = declaration.getInitializer();
+        if (initializer) {
+          emitParameters(file, initializer, id, byDeclaration, events, options);
+        }
+      }
     }
+    emitLocalVariables(file, sourceFile, byDeclaration, events, options);
   }
   return byDeclaration;
 }
 
-export function extractSymbolRelationships(repo: string, files: FileInfo[], symbolIndex: SymbolIndex, events: EventBuffer): void {
+export function extractSymbolRelationships(repo: string, files: FileInfo[], symbolIndex: SymbolIndex, events: EventBuffer, options: SymbolRelationshipOptions = { includeIdentifierReferences: false }): void {
+  const seen = new Set<string>();
+  const symbolsByName = uniqueSymbolsByName(symbolIndex);
+  const addSymbolEdge = (rel: string, from: string, to: string, sourceFile: string, startLine: number, endLine: number, reason: string, confidence: number) => {
+    const key = `${rel}\0${from}\0${to}\0${sourceFile}\0${startLine}\0${endLine}\0${reason}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    events.add(edge(rel, from, to, meta(sourceFile, startLine, endLine, reason, confidence)));
+  };
   for (const file of files) {
     file.sourceFile.forEachDescendant((current) => {
-      if (Node.isPropertyAccessExpression(current) || Node.isIdentifier(current)) {
-        const symbolId = symbolIdForNode(current, repo, symbolIndex);
-        const owner = enclosingSymbolId(current, repo, symbolIndex);
+      if (options.includeIdentifierReferences && (Node.isPropertyAccessExpression(current) || Node.isIdentifier(current))) {
+        const symbolId = symbolIdForNode(current, symbolIndex, symbolsByName);
+        const owner = relationOwnerSymbolId(current, symbolIndex);
         if (symbolId && owner && symbolId !== owner) {
-          events.add(edge("REFERENCES", owner, symbolId, meta(file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_reference_resolved", 1)));
+          addSymbolEdge("REFERENCES", owner, symbolId, file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_reference_resolved", 1);
         }
       }
       if (Node.isCallExpression(current) || Node.isNewExpression(current)) {
         const expression = Node.isCallExpression(current) ? current.getExpression() : current.getExpression();
-        const target = expression ? symbolIdForNode(expression, repo, symbolIndex) : undefined;
-        const owner = enclosingSymbolId(current, repo, symbolIndex);
+        const target = expression ? symbolIdForNode(expression, symbolIndex, symbolsByName) : undefined;
+        const owner = relationOwnerSymbolId(current, symbolIndex);
         if (target && owner && target !== owner) {
-          events.add(edge(Node.isNewExpression(current) ? "INSTANTIATES" : "CALLS", owner, target, meta(file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_call_resolved", 1)));
+          addSymbolEdge(Node.isNewExpression(current) ? "INSTANTIATES" : "CALLS", owner, target, file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_call_text_resolved", 0.75);
         }
       }
       if (Node.isJsxOpeningElement(current) || Node.isJsxSelfClosingElement(current)) {
         const tag = current.getTagNameNode();
-        const target = symbolIdForNode(tag, repo, symbolIndex);
-        const owner = enclosingSymbolId(current, repo, symbolIndex);
+        const target = symbolIdForNode(tag, symbolIndex, symbolsByName);
+        const owner = relationOwnerSymbolId(current, symbolIndex);
         if (target && owner && target !== owner) {
-          events.add(edge("RENDERS", owner, target, meta(file.path, current.getStartLineNumber(), current.getEndLineNumber(), "jsx_component_resolved", 1)));
+          addSymbolEdge("RENDERS", owner, target, file.path, current.getStartLineNumber(), current.getEndLineNumber(), "jsx_component_text_resolved", 0.75);
         }
       }
       if (Node.isTypeReference(current)) {
-        const target = symbolIdForNode(current.getTypeName(), repo, symbolIndex);
-        const owner = enclosingSymbolId(current, repo, symbolIndex);
+        const target = symbolIdForNode(current.getTypeName(), symbolIndex, symbolsByName);
+        const owner = relationOwnerSymbolId(current, symbolIndex);
         if (target && owner && target !== owner) {
-          events.add(edge("USES_TYPE", owner, target, meta(file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_type_reference_resolved", 1)));
+          addSymbolEdge("USES_TYPE", owner, target, file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_type_reference_text_resolved", 0.75);
         }
       }
       if (Node.isPropertyAccessExpression(current) && current.getExpression().getText() === "process.env") {
@@ -128,7 +150,17 @@ function symbolKind(name: string, declaration: Node): string {
   if (Node.isInterfaceDeclaration(declaration)) return "interface";
   if (Node.isTypeAliasDeclaration(declaration)) return "type";
   if (Node.isMethodDeclaration(declaration)) return "method";
-  if (Node.isVariableDeclaration(declaration)) return /^[A-Z]/.test(name) ? "component" : "constant";
+  if (Node.isVariableDeclaration(declaration)) {
+    const initializer = declaration.getInitializer();
+    if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
+      if (/^[A-Z]/.test(name)) return "component";
+      if (name.startsWith("use")) return "hook";
+      return "function_variable";
+    }
+    if (initializer && Node.isClassExpression(initializer)) return "class";
+    if (isTopLevelVariable(declaration)) return "global_variable";
+    return "local_variable";
+  }
   if (/^[A-Z]/.test(name)) return "component";
   if (name.startsWith("use")) return "hook";
   return "function";
@@ -152,13 +184,165 @@ function isExported(declaration: Node): boolean {
   return false;
 }
 
-function symbolIdForNode(node: Node, repo: string, symbolIndex: SymbolIndex): string | undefined {
-  const declarations = node.getSymbol()?.getDeclarations() ?? node.getType().getSymbol()?.getDeclarations() ?? [];
+function symbolIdForNode(node: Node, symbolIndex: SymbolIndex, symbolsByName: Map<string, string>): string | undefined {
+  const symbol = node.getSymbol();
+  const declarations = symbol?.getAliasedSymbol()?.getDeclarations() ?? symbol?.getDeclarations() ?? node.getType().getSymbol()?.getDeclarations() ?? [];
   for (const declaration of declarations) {
     const id = symbolIndex.get(declarationKey(declaration));
     if (id) return id;
   }
+  const name = referencedName(node);
+  if (!name) return undefined;
+  return symbolsByName.get(name);
+}
+
+function referencedName(node: Node): string | undefined {
+  if (Node.isIdentifier(node)) return node.getText();
+  if (Node.isPropertyAccessExpression(node)) return node.getName();
+  const text = node.getText();
+  if (!text) return undefined;
+  return text.split(".").at(-1);
+}
+
+function declarationCode(declaration: Node): string | undefined {
+  if (
+    Node.isFunctionDeclaration(declaration) ||
+    Node.isClassDeclaration(declaration) ||
+    Node.isMethodDeclaration(declaration)
+  ) {
+    return declaration.getText();
+  }
+  if (Node.isVariableDeclaration(declaration)) {
+    const initializer = declaration.getInitializer();
+    if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer) || Node.isClassExpression(initializer))) {
+      return boundedCode(declaration.getText(), 8000);
+    }
+    if (isTopLevelVariable(declaration)) {
+      return boundedCode(declaration.getText(), 4000);
+    }
+  }
   return undefined;
+}
+
+function emitParameters(file: FileInfo, declaration: Node, ownerId: string, byDeclaration: SymbolIndex, events: EventBuffer, options: SymbolOptions): void {
+  if (!hasParameters(declaration)) return;
+  for (const parameter of declaration.getParameters()) {
+    const name = parameter.getName();
+    if (!name) continue;
+    const id = childSymbolId(file.path, ownerId, "param", name, parameter.getStartLineNumber());
+    byDeclaration.set(declarationKey(parameter), id);
+    events.add(
+      node("Symbol", id, {
+        name,
+        kind: "parameter",
+        language: "typescript",
+        filePath: file.path,
+        packageId: file.packageId,
+        ownerId,
+        scope: "parameter",
+        startLine: parameter.getStartLineNumber(),
+        endLine: parameter.getEndLineNumber(),
+        exported: false,
+        signature: options.includeSignature ? parameter.getText().split("\n")[0]?.trim() : undefined,
+        code: options.includeSignature ? boundedCode(parameter.getText(), 1000) : undefined,
+        confidence: 1,
+      }),
+    );
+    events.add(edge("HAS_PARAMETER", ownerId, id, meta(file.path, parameter.getStartLineNumber(), parameter.getEndLineNumber(), "typescript_function_parameter", 1)));
+  }
+}
+
+function emitLocalVariables(file: FileInfo, sourceFile: SourceFile, byDeclaration: SymbolIndex, events: EventBuffer, options: SymbolOptions): void {
+  sourceFile.forEachDescendant((current) => {
+    if (!Node.isVariableDeclaration(current) || isTopLevelVariable(current)) return;
+    const name = current.getName();
+    if (!name) return;
+    const ownerId = enclosingSymbolId(current.getParent(), "", byDeclaration);
+    if (!ownerId) return;
+    const id = childSymbolId(file.path, ownerId, "var", name, current.getStartLineNumber());
+    byDeclaration.set(declarationKey(current), id);
+    const kind = symbolKind(name, current);
+    events.add(
+      node("Symbol", id, {
+        name,
+        kind,
+        language: "typescript",
+        filePath: file.path,
+        packageId: file.packageId,
+        ownerId,
+        scope: "function",
+        startLine: current.getStartLineNumber(),
+        endLine: current.getEndLineNumber(),
+        exported: false,
+        signature: options.includeSignature ? current.getText().split("\n")[0]?.trim() : undefined,
+        code: options.includeSignature ? localVariableCode(current) : undefined,
+        confidence: 1,
+      }),
+    );
+    events.add(edge("DECLARES_VARIABLE", ownerId, id, meta(file.path, current.getStartLineNumber(), current.getEndLineNumber(), "typescript_function_variable", 1)));
+    const initializer = current.getInitializer();
+    if (initializer) {
+      emitParameters(file, initializer, id, byDeclaration, events, options);
+    }
+  });
+}
+
+function localVariableCode(declaration: Node): string | undefined {
+  if (!Node.isVariableDeclaration(declaration)) return undefined;
+  const initializer = declaration.getInitializer();
+  if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer) || Node.isClassExpression(initializer))) {
+    return boundedCode(declaration.getText(), 4000);
+  }
+  return boundedCode(declaration.getText(), 1000);
+}
+
+function hasParameters(node: Node): node is Node & { getParameters(): ParameterDeclaration[] } {
+  return (
+    Node.isFunctionDeclaration(node) ||
+    Node.isMethodDeclaration(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isArrowFunction(node) ||
+    Node.isConstructorDeclaration(node)
+  );
+}
+
+function symbolScope(declaration: Node): string {
+  if (Node.isVariableDeclaration(declaration) && isTopLevelVariable(declaration)) return "module";
+  if (Node.isMethodDeclaration(declaration)) return "class";
+  return "module";
+}
+
+function isTopLevelVariable(declaration: Node): boolean {
+  if (!Node.isVariableDeclaration(declaration)) return false;
+  return Node.isSourceFile(declaration.getVariableStatement()?.getParent());
+}
+
+function childSymbolId(filePath: string, ownerId: string, kind: string, name: string, line: number): string {
+  const owner = ownerId.split("#").at(-1) ?? ownerId;
+  return stableSymbolId(filePath, `${owner}::${kind}:${name}:${line}`);
+}
+
+function boundedCode(code: string, maxLength: number): string {
+  if (code.length <= maxLength) return code;
+  return `${code.slice(0, maxLength)}\n/* code truncated at ${maxLength} characters */`;
+}
+
+function uniqueSymbolsByName(symbolIndex: SymbolIndex): Map<string, string> {
+  const out = new Map<string, string>();
+  const duplicated = new Set<string>();
+  for (const id of symbolIndex.values()) {
+    const name = id.split("#").at(-1);
+    if (!name) continue;
+    if (out.has(name)) {
+      duplicated.add(name);
+      out.delete(name);
+      continue;
+    }
+    if (!duplicated.has(name)) {
+      out.set(name, id);
+    }
+  }
+  return out;
 }
 
 function enclosingSymbolId(node: Node, repo: string, symbolIndex: SymbolIndex): string | undefined {
@@ -168,6 +352,26 @@ function enclosingSymbolId(node: Node, repo: string, symbolIndex: SymbolIndex): 
     current = current.getParent();
   }
   return undefined;
+}
+
+function relationOwnerSymbolId(node: Node, symbolIndex: SymbolIndex): string | undefined {
+  let current: Node | undefined = node;
+  while (current) {
+    if (symbolIndex.has(declarationKey(current)) && relationOwnerEligible(current)) {
+      return symbolIndex.get(declarationKey(current));
+    }
+    current = current.getParent();
+  }
+  return undefined;
+}
+
+function relationOwnerEligible(node: Node): boolean {
+  if (Node.isParameterDeclaration(node)) return false;
+  if (Node.isVariableDeclaration(node)) {
+    const initializer = node.getInitializer();
+    return !!initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer) || Node.isClassExpression(initializer));
+  }
+  return true;
 }
 
 function declarationKey(node: Node): string {

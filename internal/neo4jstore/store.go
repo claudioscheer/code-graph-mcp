@@ -11,16 +11,19 @@ import (
 )
 
 type Store struct {
-	driver neo4j.DriverWithContext
-	ripple string
+	driver    neo4j.DriverWithContext
+	ripple    string
+	pending   []events.GraphEvent
+	batchSize int
 }
 
 type Ripple struct {
-	Name      string `json:"name"`
-	Repo      string `json:"repo"`
-	Language  string `json:"language"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
-	CreatedAt string `json:"createdAt,omitempty"`
+	Name         string `json:"name"`
+	Repo         string `json:"repo"`
+	Language     string `json:"language"`
+	AnalysisMode string `json:"analysisMode"`
+	UpdatedAt    string `json:"updatedAt,omitempty"`
+	CreatedAt    string `json:"createdAt,omitempty"`
 }
 
 func New(uri string, user string, password string) (*Store, error) {
@@ -44,7 +47,7 @@ func (s *Store) VerifyConnectivity(ctx context.Context) error {
 }
 
 func (s *Store) ForRipple(name string) *Store {
-	return &Store{driver: s.driver, ripple: name}
+	return &Store{driver: s.driver, ripple: name, batchSize: 1000}
 }
 
 func (s *Store) CreateConstraints(ctx context.Context) error {
@@ -100,21 +103,23 @@ func (s *Store) SaveRipple(ctx context.Context, ripple Ripple) error {
 	if ripple.Name == "" {
 		return fmt.Errorf("ripple is required")
 	}
+	analysisMode := NormalizeAnalysisMode(ripple.AnalysisMode)
 	now := time.Now().Format(time.RFC3339)
 	_, err := neo4j.ExecuteQuery(ctx, s.driver, `
 		MERGE (r:Ripple {name: $name})
 		ON CREATE SET r.createdAt = $now
 		SET r.repo = $repo,
 			r.language = $language,
+			r.analysisMode = $analysisMode,
 			r.updatedAt = $now
-	`, map[string]any{"name": ripple.Name, "repo": ripple.Repo, "language": ripple.Language, "now": now}, neo4j.EagerResultTransformer)
+	`, map[string]any{"name": ripple.Name, "repo": ripple.Repo, "language": ripple.Language, "analysisMode": analysisMode, "now": now}, neo4j.EagerResultTransformer)
 	return err
 }
 
 func (s *Store) GetRipple(ctx context.Context, name string) (Ripple, error) {
 	result, err := neo4j.ExecuteQuery(ctx, s.driver, `
 		MATCH (r:Ripple {name: $name})
-		RETURN r.name AS name, r.repo AS repo, r.language AS language, r.createdAt AS createdAt, r.updatedAt AS updatedAt
+		RETURN r.name AS name, r.repo AS repo, r.language AS language, r.analysisMode AS analysisMode, r.createdAt AS createdAt, r.updatedAt AS updatedAt
 	`, map[string]any{"name": name}, neo4j.EagerResultTransformer)
 	if err != nil {
 		return Ripple{}, err
@@ -124,18 +129,19 @@ func (s *Store) GetRipple(ctx context.Context, name string) (Ripple, error) {
 	}
 	values := result.Records[0].AsMap()
 	return Ripple{
-		Name:      stringValue(values["name"]),
-		Repo:      stringValue(values["repo"]),
-		Language:  stringValue(values["language"]),
-		CreatedAt: stringValue(values["createdAt"]),
-		UpdatedAt: stringValue(values["updatedAt"]),
+		Name:         stringValue(values["name"]),
+		Repo:         stringValue(values["repo"]),
+		Language:     stringValue(values["language"]),
+		AnalysisMode: NormalizeAnalysisMode(stringValue(values["analysisMode"])),
+		CreatedAt:    stringValue(values["createdAt"]),
+		UpdatedAt:    stringValue(values["updatedAt"]),
 	}, nil
 }
 
 func (s *Store) ListRipples(ctx context.Context) ([]Ripple, error) {
 	result, err := neo4j.ExecuteQuery(ctx, s.driver, `
 		MATCH (r:Ripple)
-		RETURN r.name AS name, r.repo AS repo, r.language AS language, r.createdAt AS createdAt, r.updatedAt AS updatedAt
+		RETURN r.name AS name, r.repo AS repo, r.language AS language, r.analysisMode AS analysisMode, r.createdAt AS createdAt, r.updatedAt AS updatedAt
 		ORDER BY r.name
 	`, nil, neo4j.EagerResultTransformer)
 	if err != nil {
@@ -145,22 +151,49 @@ func (s *Store) ListRipples(ctx context.Context) ([]Ripple, error) {
 	for _, record := range result.Records {
 		values := record.AsMap()
 		ripples = append(ripples, Ripple{
-			Name:      stringValue(values["name"]),
-			Repo:      stringValue(values["repo"]),
-			Language:  stringValue(values["language"]),
-			CreatedAt: stringValue(values["createdAt"]),
-			UpdatedAt: stringValue(values["updatedAt"]),
+			Name:         stringValue(values["name"]),
+			Repo:         stringValue(values["repo"]),
+			Language:     stringValue(values["language"]),
+			AnalysisMode: NormalizeAnalysisMode(stringValue(values["analysisMode"])),
+			CreatedAt:    stringValue(values["createdAt"]),
+			UpdatedAt:    stringValue(values["updatedAt"]),
 		})
 	}
 	return ripples, nil
 }
 
+func NormalizeAnalysisMode(mode string) string {
+	if mode == "fast" {
+		return "fast"
+	}
+	return "full"
+}
+
 func (s *Store) Emit(ctx context.Context, event events.GraphEvent) error {
-	return s.ApplyEvent(ctx, event)
+	if s.ripple == "" {
+		return fmt.Errorf("ripple is required")
+	}
+	if err := events.Validate(event); err != nil {
+		return err
+	}
+	s.pending = append(s.pending, event)
+	batchSize := s.batchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	if len(s.pending) >= batchSize {
+		return s.Flush(ctx)
+	}
+	return nil
 }
 
 func (s *Store) Flush(ctx context.Context) error {
-	return nil
+	if len(s.pending) == 0 {
+		return nil
+	}
+	pending := s.pending
+	s.pending = nil
+	return s.applyEvents(ctx, pending)
 }
 
 func (s *Store) ApplyEvent(ctx context.Context, event events.GraphEvent) error {
@@ -180,6 +213,73 @@ func (s *Store) ApplyEvent(ctx context.Context, event events.GraphEvent) error {
 	default:
 		return nil
 	}
+}
+
+func (s *Store) applyEvents(ctx context.Context, batch []events.GraphEvent) error {
+	nodesByLabel := map[string][]map[string]any{}
+	edgesByRel := map[string][]map[string]any{}
+	metaEvents := []events.GraphEvent{}
+	for _, event := range batch {
+		switch event.Type {
+		case events.EventNode:
+			if !safeName(event.Label) {
+				return fmt.Errorf("unsafe label %q", event.Label)
+			}
+			props := copyProps(event.Props)
+			props["id"] = scopedID(s.ripple, event.ID)
+			props["sourceId"] = event.ID
+			props["ripple"] = s.ripple
+			props["primaryLabel"] = event.Label
+			nodesByLabel[event.Label] = append(nodesByLabel[event.Label], props)
+		case events.EventEdge:
+			if !safeName(event.Rel) {
+				return fmt.Errorf("unsafe relationship %q", event.Rel)
+			}
+			props := copyProps(event.Props)
+			props["type"] = event.Rel
+			props["ripple"] = s.ripple
+			props["sourceFrom"] = event.From
+			props["sourceTo"] = event.To
+			identity := relationshipIdentity(event)
+			props["identity"] = identity
+			edgesByRel[event.Rel] = append(edgesByRel[event.Rel], map[string]any{
+				"from":     scopedID(s.ripple, event.From),
+				"to":       scopedID(s.ripple, event.To),
+				"identity": identity,
+				"props":    props,
+			})
+		case events.EventWarning, events.EventSummary:
+			metaEvents = append(metaEvents, event)
+		}
+	}
+	for label, rows := range nodesByLabel {
+		query := fmt.Sprintf(`
+			UNWIND $rows AS props
+			MERGE (n:GraphNode:%s {id: props.id})
+			SET n += props
+		`, label)
+		if _, err := neo4j.ExecuteQuery(ctx, s.driver, query, map[string]any{"rows": rows}, neo4j.EagerResultTransformer); err != nil {
+			return err
+		}
+	}
+	for rel, rows := range edgesByRel {
+		query := fmt.Sprintf(`
+			UNWIND $rows AS row
+			MATCH (from:GraphNode {id: row.from})
+			MATCH (to:GraphNode {id: row.to})
+			MERGE (from)-[r:%s {identity: row.identity}]->(to)
+			SET r += row.props
+		`, rel)
+		if _, err := neo4j.ExecuteQuery(ctx, s.driver, query, map[string]any{"rows": rows}, neo4j.EagerResultTransformer); err != nil {
+			return err
+		}
+	}
+	for _, event := range metaEvents {
+		if err := s.applyMeta(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) applyNode(ctx context.Context, event events.GraphEvent) error {
@@ -206,14 +306,22 @@ func (s *Store) applyEdge(ctx context.Context, event events.GraphEvent) error {
 	props["ripple"] = s.ripple
 	props["sourceFrom"] = event.From
 	props["sourceTo"] = event.To
+	identity := relationshipIdentity(event)
+	props["identity"] = identity
 	query := fmt.Sprintf(`
 		MATCH (from:GraphNode {id: $from})
 		MATCH (to:GraphNode {id: $to})
-		MERGE (from)-[r:%s]->(to)
+		MERGE (from)-[r:%s {identity: $identity}]->(to)
 		SET r += $props
 	`, event.Rel)
-	_, err := neo4j.ExecuteQuery(ctx, s.driver, query, map[string]any{"from": scopedID(s.ripple, event.From), "to": scopedID(s.ripple, event.To), "props": props}, neo4j.EagerResultTransformer)
+	_, err := neo4j.ExecuteQuery(ctx, s.driver, query, map[string]any{"from": scopedID(s.ripple, event.From), "to": scopedID(s.ripple, event.To), "identity": identity, "props": props}, neo4j.EagerResultTransformer)
 	return err
+}
+
+func relationshipIdentity(event events.GraphEvent) string {
+	sourceFile, _ := event.Props["sourceFile"].(string)
+	reason, _ := event.Props["reason"].(string)
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%v\x00%v\x00%s", event.Rel, event.From, event.To, sourceFile, event.Props["startLine"], event.Props["endLine"], reason)
 }
 
 func (s *Store) applyMeta(ctx context.Context, event events.GraphEvent) error {
