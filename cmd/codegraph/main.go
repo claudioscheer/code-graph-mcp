@@ -201,7 +201,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "CodeGraph MCP running for ripple %q (%s)\n", *ripple, info.Repo)
-		return mcp.Server{Query: graph.Service{Driver: store.Driver(), Ripple: *ripple}, Repo: info.Repo}.Serve(ctx, os.Stdin, os.Stdout)
+		return newMCPServer(store, cfg, *ripple, info).Serve(ctx, os.Stdin, os.Stdout)
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 		addr := fs.String("addr", ":8080", "HTTP listen address")
@@ -257,7 +257,7 @@ func serveHTTP(ctx context.Context, cfg config.Config, addr string) error {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		response, ok := (mcp.Server{Query: graph.Service{Driver: store.Driver(), Ripple: ripple}, Repo: info.Repo}).Process(r.Context(), payload)
+		response, ok := newMCPServer(store, cfg, ripple, info).Process(r.Context(), payload)
 		if !ok {
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -272,6 +272,64 @@ func serveHTTP(ctx context.Context, cfg config.Config, addr string) error {
 	}()
 	fmt.Fprintf(os.Stderr, "CodeGraph HTTP MCP server running on %s with endpoints /mcp/{ripple}\n", addr)
 	return server.ListenAndServe()
+}
+
+func newMCPServer(store *neo4jstore.Store, cfg config.Config, ripple string, info neo4jstore.Ripple) mcp.Server {
+	return mcp.Server{
+		Query:     graph.Service{Driver: store.Driver(), Ripple: ripple},
+		Repo:      info.Repo,
+		Reindexer: rippleReindexer{store: store, cfg: cfg, ripple: ripple},
+	}
+}
+
+// rippleReindexer performs a full ripple rebuild (same as `codegraph update`).
+// Paths on the request are advisory only until file-level incremental extract exists.
+type rippleReindexer struct {
+	store  *neo4jstore.Store
+	cfg    config.Config
+	ripple string
+}
+
+func (r rippleReindexer) Reindex(ctx context.Context, req mcp.ReindexRequest) (map[string]any, error) {
+	info, err := r.store.GetRipple(ctx, r.ripple)
+	if err != nil {
+		return nil, err
+	}
+	if info.Language != "typescript" {
+		return nil, fmt.Errorf("only typescript is supported in v1, ripple %q uses %q", r.ripple, info.Language)
+	}
+	mode := info.AnalysisMode
+	if req.AnalysisMode != "" {
+		parsed, err := parseAnalysisMode(req.AnalysisMode)
+		if err != nil {
+			return nil, err
+		}
+		mode = parsed
+	}
+	mode = neo4jstore.NormalizeAnalysisMode(mode)
+	info.AnalysisMode = mode
+	if err := r.store.ResetRipple(ctx, r.ripple); err != nil {
+		return nil, err
+	}
+	if err := r.store.SaveRipple(ctx, info); err != nil {
+		return nil, err
+	}
+	if err := (plugins.Runner{Stderr: os.Stderr}).Run(ctx, typescriptPlugin(r.cfg), plugins.ExtractRequest{
+		Repo: info.Repo, Protocol: events.Protocol, AnalysisMode: mode,
+	}, r.store.ForRipple(r.ripple)); err != nil {
+		return nil, err
+	}
+	out := map[string]any{
+		"status":       "updated",
+		"ripple":       r.ripple,
+		"repo":         info.Repo,
+		"analysisMode": mode,
+		"language":     info.Language,
+	}
+	if len(req.Paths) > 0 {
+		out["requestedPaths"] = req.Paths
+	}
+	return out, nil
 }
 
 func openStore(ctx context.Context, cfg config.Config) (*neo4jstore.Store, error) {

@@ -90,12 +90,19 @@ func compactToolResult(tool string, result any, maxItems int) string {
 
 func headerKeys(values map[string]any) map[string]bool {
 	keys := map[string]bool{}
-	for _, key := range []string{"query", "symbol", "oldName", "callee", "envName", "ripple", "requiredBeforeCall"} {
+	for _, key := range []string{"query", "symbol", "oldName", "callee", "envName", "ripple", "requiredBeforeCall", "planKind", "status"} {
 		if firstAnyString(values, key) != "" {
 			keys[key] = true
 		}
 	}
-	for _, key := range []string{"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount", "totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites", "truncated", "contextCompleteForPlanning"} {
+	for _, key := range []string{
+		"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount",
+		"totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites",
+		"truncated", "contextCompleteForPlanning", "resolutionMethod", "confidence",
+		"needsDisambiguation", "graphReliable", "stale", "hasCallGraph", "dirtyFileCount",
+		"exactCount", "ambiguous", "seedCount", "dependentCount", "relatedTestCount",
+		"packageCount", "symbolCount", "seedPathCount", "success", "incremental",
+	} {
 		if value, ok := values[key]; ok && isScalar(value) {
 			keys[key] = true
 		}
@@ -105,7 +112,7 @@ func headerKeys(values map[string]any) map[string]bool {
 
 func compactHeader(tool string, values map[string]any) string {
 	parts := []string{tool}
-	for _, key := range []string{"query", "symbol", "oldName", "callee", "envName", "ripple"} {
+	for _, key := range []string{"query", "symbol", "oldName", "callee", "envName", "ripple", "planKind", "status"} {
 		if value := firstAnyString(values, key); value != "" {
 			parts = append(parts, quoteIfNeeded(value))
 			break
@@ -114,15 +121,23 @@ func compactHeader(tool string, values map[string]any) string {
 	if required := firstAnyString(values, "requiredBeforeCall"); required != "" {
 		parts = append(parts, "requires="+quoteIfNeeded(required))
 	}
-	for _, key := range []string{"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount", "totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites"} {
+	for _, key := range []string{
+		"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount",
+		"totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites",
+		"resolutionMethod", "confidence", "dirtyFileCount", "exactCount",
+		"seedCount", "dependentCount", "relatedTestCount", "packageCount",
+		"symbolCount", "seedPathCount",
+	} {
 		if value, ok := values[key]; ok {
 			if isScalar(value) {
 				parts = append(parts, fmt.Sprintf("%s=%v", key, value))
 			}
 		}
 	}
-	if value, ok := values["truncated"]; ok {
-		parts = append(parts, fmt.Sprintf("truncated=%v", value))
+	for _, key := range []string{"needsDisambiguation", "graphReliable", "stale", "hasCallGraph", "ambiguous", "truncated", "success", "incremental"} {
+		if value, ok := values[key]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%v", key, value))
+		}
 	}
 	if value, ok := values["contextCompleteForPlanning"]; ok {
 		parts = append(parts, fmt.Sprintf("planningReady=%v", value))

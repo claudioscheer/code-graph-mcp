@@ -173,6 +173,42 @@ func TestCountLiteralFilesReturnsPathsOnly(t *testing.T) {
 	}
 }
 
+func TestAnalyzeFunctionImpactRespectsPackageScope(t *testing.T) {
+	repo := t.TempDir()
+	writeTestFile(t, repo, "packages/auth/src/session.ts", `
+export function getSession() { return null; }
+`)
+	writeTestFile(t, repo, "packages/billing/src/session.ts", `
+export function getSession() { return null; }
+export function useBilling() { getSession(); }
+`)
+	writeTestFile(t, repo, "packages/auth/src/client.ts", `
+import { getSession } from './session';
+export function load() { getSession(); }
+`)
+
+	result, err := analyzeFunctionImpact(repo, "getSession", functionImpactOptions{
+		Package: "auth",
+		Limit:   40,
+	})
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	for _, path := range result.Files {
+		if pathPackageMatch(path, "billing") && !pathPackageMatch(path, "auth") {
+			t.Fatalf("unexpected billing file in scoped impact: %s (%v)", path, result.Files)
+		}
+	}
+	if result.UniqueFiles < 2 {
+		t.Fatalf("UniqueFiles=%d want >=2 in auth scope: %v", result.UniqueFiles, result.Files)
+	}
+	for _, path := range result.Files {
+		if !pathPackageMatch(path, "auth") {
+			t.Fatalf("file %s not in auth package", path)
+		}
+	}
+}
+
 func TestAnalyzeFunctionImpactClassifiesBlastRadius(t *testing.T) {
 	repo := t.TempDir()
 	writeTestFile(t, repo, "packages/core/lib/integrationMetrics.js", `

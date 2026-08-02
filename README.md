@@ -32,7 +32,41 @@ CodeGraph is a **specialized impact and navigation layer** for agents. It is **n
 1. Use CodeGraph **first** for planning, blast radius, rename impact, env usage, and call-site contract questions (one high-level tool).
 2. Use normal tools to **read exact source, edit code, run tests, and check git**.
 3. Never use CodeGraph as the only code-reading path.
-4. Treat graph answers as incomplete unless the index is fresh and you understand the ripple `analysisMode` (fast mode may omit symbol-level relations).
+4. Treat graph answers as incomplete when `graphReliable=false`, `stale=true`, `confidence=low`, or `needsDisambiguation=true`.
+
+The same policy is embedded in the MCP so agents see it without reading this README:
+
+- **`initialize.instructions`** — full agent workflow text (clients that honor MCP server instructions).
+- **`codegraph_help`** — structured `workflow` object + short router.
+- High-level **tool descriptions** — step hints (e.g. prepare_change_plan is primary for huge changes).
+
+### Agent workflow: huge / multi-file changes
+
+```text
+1. get_index_freshness
+   → note stale / graphReliable
+
+2. prepare_change_plan  { symbols[], paths[] | useDirty: true }
+   (single feature only → prepare_feature_context)
+
+3. if needsDisambiguation
+   → resolve_symbol { package | pathPrefix | symbolId }
+   → rerun step 2 / analyze_function_impact with the pick
+
+4. Implement with normal tools
+   → edit mustEdit in suggestedOrder
+   → verify mustVerify
+   → open only openNext (or suggestedFollowUpReads)
+
+5. After a batch of edits
+   → analyze_path_set_impact { useDirty: true }   # cheap, live text + graph if warm
+
+6. If you need hybrid CALLS again and graph is stale
+   → reindex { timeoutSec: 300 }                  # full ripple rebuild
+   → re-run prepare_change_plan / analyze_function_impact
+```
+
+Specialized (not the default path): `analyze_rename_impact`, `find_env_usages`, `analyze_callsite_contract`. On monorepos pass `package` or `pathPrefix` when names are common.
 
 ### Why CodeGraph is good
 
@@ -220,19 +254,26 @@ Results default to **compact summary text** to keep agent token use low. Pass `d
 
 ### High-level (prefer these)
 
-- `prepare_feature_context`: one-call planning pack (entry points, likely edit files, tests, compact blast radius).
-- `analyze_function_impact`: blast radius for a function/hook/component/symbol. `transitiveDepth` defaults to 0.
+- `prepare_feature_context`: one-call planning pack for a single feature/symbol query. Prefer `prepare_change_plan` for multi-target work.
+- `prepare_change_plan`: **multi-target** plan from `symbols[]` and/or `paths[]` (or `useDirty=true`). Returns `mustEdit`, `mustVerify`, `suggestedOrder`, `openNext`, `packages`, `confidence`, `needsDisambiguation`.
+- `resolve_symbol`: disambiguate a symbol name to ranked graph candidates (`package`, `pathPrefix`, or `symbolId`).
+- `analyze_function_impact`: **hybrid** blast radius (graph `CALLS`/`IMPORTS_SYMBOL` + filesystem text residual). Returns `resolutionMethod`, `confidence`, `needsDisambiguation`, `graphReliable`, `stale`.
+- `analyze_path_set_impact`: blast radius for a **path set** (graph file deps + text importers/tests). Supports `useDirty`.
 - `analyze_rename_impact`: rename/migration impact grouped by runtime/config/tests/docs/scripts.
 - `analyze_callsite_contract`: find call sites missing a required pre-call check.
-- `count_literal_files`: exact string file counts and paths.
 - `find_env_usages`: runtime `process.env.NAME` reads only.
+- `count_literal_files`: exact string file counts and paths.
+- `reindex`: full ripple rebuild from MCP (same as `codegraph update`). Not file-incremental yet; `paths`/`useDirty` are advisory for follow-up impact. Long-running (`timeoutSec`, default 300).
 
-### Graph / source
+### Graph / source (advanced)
 
 - `search_code`, `find_symbol`, `find_file`: indexed graph search.
-- `get_relations`, `get_dependencies`, `get_dependents`, `find_paths`: graph traversal (keep depth/limit low).
-- `open_file_excerpt`, `open_symbol_body`: source text after paths are known (default excerpt 40 lines, hard max 120).
-- `get_ripple_info`, `get_index_freshness`, `list_node_types`: index metadata.
+- `get_relations`: graph traversal for a known node id (keep depth/limit low).
+- `open_file_excerpt`, `open_symbol_body`: source text after paths are known.
+- `get_index_freshness`: dirty tree, relation counts, `graphReliable` / `stale`.
 - `codegraph_help`: short router only; do not call this first on every task.
 
-Hidden aliases kept for older clients but not advertised: `get_impact`, `get_route_impact`, `get_related_tests`, `search_literal`.
+Hidden aliases still callable but not advertised: `get_ripple_info`, `list_node_types`, `get_dependencies`, `get_dependents`, `find_paths`, `get_impact`, `get_route_impact`, `get_related_tests`, `search_literal`.
+
+**Hybrid impact policy:** when `needsDisambiguation=true`, rerun with `package`, `pathPrefix`, or `symbolId` from `resolve_symbol` before broad edits. When `graphReliable=false` or `stale=true`, call `reindex` or trust text residual only.
+

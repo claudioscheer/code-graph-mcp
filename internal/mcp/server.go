@@ -16,8 +16,9 @@ import (
 )
 
 type Server struct {
-	Query graph.Service
-	Repo  string
+	Query     graph.Service
+	Repo      string
+	Reindexer Reindexer // optional; enables reindex tool (full ripple rebuild)
 }
 
 type request struct {
@@ -70,7 +71,14 @@ func (s Server) Process(ctx context.Context, payload []byte) (map[string]any, bo
 func (s Server) handle(ctx context.Context, req request) (any, error) {
 	switch req.Method {
 	case "initialize":
-		return map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "codegraph", "version": "0.1.0"}}, nil
+		// instructions: MCP clients that honor server instructions inject this into the agent
+		// context without requiring codegraph_help. Keep workflowSpec() in sync.
+		return map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "codegraph", "version": "0.1.0"},
+			"instructions":    AgentInstructions,
+		}, nil
 	case "tools/list":
 		return map[string]any{"tools": tools()}, nil
 	case "tools/call":
@@ -98,10 +106,6 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 	switch params.Name {
 	case "codegraph_help":
 		result = s.help()
-	case "get_ripple_info":
-		result, err = s.Query.Metadata(ctx)
-	case "list_node_types":
-		result, err = s.Query.Types(ctx)
 	case "get_index_freshness":
 		result, err = s.indexFreshness(ctx)
 	case "search_code":
@@ -121,14 +125,24 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 		result, err = s.analyzeCallsiteContract(firstStringArg(args, "callee", "function", "symbol", "query", "q"), firstStringArg(args, "requiredBeforeCall", "required", "precheck", "check"), args)
 	case "prepare_feature_context":
 		result, err = s.prepareFeatureContext(ctx, firstStringArg(args, "query", "q", "feature", "symbol", "name", "path"), args)
+	case "prepare_change_plan":
+		result, err = s.prepareChangePlan(ctx, args)
+	case "analyze_path_set_impact":
+		result, err = s.analyzePathSetImpact(ctx, args)
+	case "reindex":
+		result, err = s.reindex(ctx, args)
+	case "resolve_symbol":
+		result, err = s.resolveImpactSymbol(ctx, firstStringArg(args, "name", "symbol", "query", "q"), args)
 	case "find_symbol":
 		result, err = s.Query.FindSymbol(ctx, firstStringArg(args, "name", "query", "q", "symbol"), opts)
 	case "find_file":
 		result, err = s.Query.FindFile(ctx, firstStringArg(args, "path", "query", "q", "file"), opts)
 	case "get_dependencies":
+		// Hidden alias of get_relations forward (kept for older clients).
 		opts.Direction = "forward"
 		result, err = s.Query.Relations(ctx, nodeIDArg(args), opts)
 	case "get_dependents":
+		// Hidden alias of get_relations reverse (kept for older clients).
 		opts.Direction = "reverse"
 		result, err = s.Query.Relations(ctx, nodeIDArg(args), opts)
 	case "get_relations":
@@ -139,7 +153,14 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 		opts.Direction = "reverse"
 		result, err = s.Query.Relations(ctx, nodeIDArg(args), opts)
 	case "find_paths":
+		// Hidden advanced graph tool (kept for older clients).
 		result, err = s.Query.Paths(ctx, firstStringArg(args, "fromId", "from", "sourceId", "startId", "source"), firstStringArg(args, "toId", "to", "targetId", "endId", "target"), opts)
+	case "list_node_types":
+		// Hidden diagnostic (prefer get_index_freshness).
+		result, err = s.Query.Types(ctx)
+	case "get_ripple_info":
+		// Hidden diagnostic (prefer get_index_freshness).
+		result, err = s.Query.Metadata(ctx)
 	case "open_file_excerpt":
 		result, err = s.openFile(firstStringArg(args, "path", "file", "filePath"), intArg(args, "startLine", 1), intArg(args, "endLine", 40))
 	case "open_symbol_body":
@@ -163,33 +184,32 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 
 func (s Server) help() map[string]any {
 	return map[string]any{
-		"ripple":  s.Query.Ripple,
-		"repo":    s.Repo,
-		"purpose": "Token-efficient code investigation for one indexed ripple. Prefer one high-level tool, then open source only for exact lines.",
+		"ripple":   s.Query.Ripple,
+		"repo":     s.Repo,
+		"purpose":  "Token-efficient impact and planning for one indexed ripple. Prefer high-level tools; use Read/Grep/git for implementation.",
+		"workflow": workflowSpec(),
 		"router": []string{
-			"feature start / planning -> prepare_feature_context",
-			"callers / blast radius -> analyze_function_impact",
-			"rename / migration -> analyze_rename_impact",
-			"env runtime reads -> find_env_usages",
-			"exact text count -> count_literal_files",
-			"guard before every call -> analyze_callsite_contract",
-			"broad explore -> search_code / find_symbol / find_file",
-			"deps for a known node id -> get_relations (depth=1, limit=20)",
-			"source text -> open_file_excerpt / open_symbol_body after paths are known",
-			"index age / mode -> get_index_freshness",
+			"single feature/symbol plan -> prepare_feature_context",
+			"multi-file / multi-symbol change -> prepare_change_plan",
+			"after edits path blast radius -> analyze_path_set_impact (useDirty)",
+			"ambiguous name -> resolve_symbol then rerun plan/impact",
+			"one-symbol callers -> analyze_function_impact",
+			"rename / env / call guards -> analyze_rename_impact | find_env_usages | analyze_callsite_contract",
+			"stale graph -> reindex (full rebuild) then re-plan",
+			"freshness flags -> get_index_freshness",
 		},
 		"tokenRules": []string{
-			"Defaults return compact summary text. Raise detail only when needed: detail=summary|files|lines, or raw=true for JSON.",
-			"Do not open files for planning. Use suggestedFollowUpReads or callSites paths only when implementing.",
-			"If truncated=true, raise limit or detail only if that changes the answer.",
-			"Fast-mode indexes may omit symbol-level relations; filesystem impact tools remain authoritative for text/call sites.",
+			"detail=summary by default; raise only when it changes the answer.",
+			"Follow mustEdit / mustVerify / openNext; do not dump whole files via CodeGraph.",
+			"needsDisambiguation → resolve_symbol first.",
+			"graphReliable=false or stale=true → text residual or reindex.",
+			"Monorepos: pass package or pathPrefix for common names.",
 		},
 		"examples": []map[string]any{
-			{"tool": "prepare_feature_context", "arguments": map[string]any{"query": "resolveTenantAccount"}},
-			{"tool": "analyze_function_impact", "arguments": map[string]any{"symbol": "resolveTenantAccount"}},
-			{"tool": "analyze_rename_impact", "arguments": map[string]any{"oldName": "SERVICE_LOGIN_EMAIL", "kind": "env"}},
-			{"tool": "count_literal_files", "arguments": map[string]any{"query": "SERVICE_LOGIN_EMAIL"}},
-			{"tool": "get_relations", "arguments": map[string]any{"sourceId": "file:src/main.ts", "direction": "inbound"}},
+			{"tool": "prepare_change_plan", "arguments": map[string]any{"symbols": []string{"getSession"}, "paths": []string{"packages/auth/src/session.ts"}}},
+			{"tool": "analyze_path_set_impact", "arguments": map[string]any{"useDirty": true}},
+			{"tool": "resolve_symbol", "arguments": map[string]any{"name": "getSession", "package": "auth"}},
+			{"tool": "reindex", "arguments": map[string]any{"timeoutSec": 300}},
 		},
 	}
 }
@@ -381,13 +401,79 @@ func (s Server) findEnvUsages(envName string, args map[string]any) (map[string]a
 }
 
 func (s Server) indexFreshness(ctx context.Context) (map[string]any, error) {
-	metadata, err := s.Query.Metadata(ctx)
-	if err != nil {
-		return nil, err
+	metadata := map[string]any{"repo": s.Repo, "ripple": s.Query.Ripple}
+	if s.Query.Driver != nil {
+		meta, err := s.Query.Metadata(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range meta {
+			metadata[key] = value
+		}
 	}
 	metadata["repo"] = s.Repo
 	metadata["localHead"] = gitOutput(s.Repo, "rev-parse", "HEAD")
 	metadata["localBranch"] = gitOutput(s.Repo, "rev-parse", "--abbrev-ref", "HEAD")
+
+	dirty := gitDirtyFiles(s.Repo)
+	metadata["dirtyFileCount"] = len(dirty)
+	if len(dirty) > 0 {
+		sample := dirty
+		if len(sample) > 10 {
+			sample = sample[:10]
+		}
+		metadata["dirtySample"] = sample
+	}
+
+	symbolRels := int64(0)
+	callRels := int64(0)
+	importRels := int64(0)
+	if s.Query.Driver != nil {
+		if n, err := s.Query.CountRelationships(ctx, []string{"CALLS", "RENDERS", "INSTANTIATES"}); err == nil {
+			callRels = n
+			symbolRels += n
+		}
+		if n, err := s.Query.CountRelationships(ctx, []string{"IMPORTS_SYMBOL"}); err == nil {
+			importRels = n
+			symbolRels += n
+		}
+	}
+	metadata["callRelationCount"] = callRels
+	metadata["importSymbolRelationCount"] = importRels
+	metadata["symbolRelationCount"] = symbolRels
+
+	analysisMode := strings.ToLower(firstAnyString(metadata, "analysisMode"))
+	if analysisMode == "" {
+		analysisMode = "unknown"
+	}
+	notes := []string{}
+	graphReliable := true
+	if s.Query.Driver == nil {
+		graphReliable = false
+		notes = append(notes, "Neo4j unavailable; impact tools use filesystem text only.")
+	}
+	if len(dirty) > 0 {
+		graphReliable = false
+		notes = append(notes, "Working tree has uncommitted changes; graph may be stale relative to disk.")
+	}
+	if callRels == 0 {
+		graphReliable = false
+		notes = append(notes, "No CALLS/RENDERS/INSTANTIATES edges; call graph unavailable (fast mode skip or empty index).")
+	}
+	if importRels == 0 && s.Query.Driver != nil {
+		notes = append(notes, "No IMPORTS_SYMBOL edges; import impact falls back to text.")
+	}
+	if analysisMode == "fast" && callRels == 0 {
+		notes = append(notes, "analysisMode=fast may omit symbol relationships on large repos.")
+	}
+	metadata["graphReliable"] = graphReliable
+	metadata["stale"] = len(dirty) > 0
+	if len(notes) > 0 {
+		metadata["freshnessNotes"] = notes
+	}
+	if !graphReliable {
+		metadata["recommendedAction"] = "Prefer text residual in impact results; reindex after large edits (codegraph update --ripple ...)."
+	}
 	return metadata, nil
 }
 
@@ -490,6 +576,46 @@ func (s Server) analyzeFunctionImpact(ctx context.Context, symbol string, args m
 	if detail == "summary" {
 		listLimit = min(listLimit, 15)
 	}
+	pathPrefix := firstStringArg(args, "pathPrefix", "prefix")
+	packageFilter := firstStringArg(args, "package", "pkg")
+	packageID := firstStringArg(args, "packageId", "pkgId")
+	if packageFilter == "" && packageID != "" {
+		packageFilter = packageID
+	}
+
+	// Symbol resolution (graph) for disambiguation + hybrid CALLS/IMPORTS.
+	resolved, err := s.resolveImpactSymbol(ctx, symbol, args)
+	if err != nil {
+		return nil, err
+	}
+	ambiguous, _ := resolved["ambiguous"].(bool)
+	needsDisambiguation := ambiguous && firstStringArg(args, "symbolId", "id") == ""
+	selectedIDs := []string{}
+	if selected, ok := resolved["selected"].(map[string]any); ok {
+		if id := firstAnyString(selected, "id", "sourceId"); id != "" {
+			selectedIDs = append(selectedIDs, id)
+		}
+	} else if !ambiguous {
+		for _, candidate := range mapSlice(resolved["candidates"]) {
+			if firstAnyString(candidate, "match") == "exact" {
+				if id := firstAnyString(candidate, "id"); id != "" {
+					selectedIDs = append(selectedIDs, id)
+				}
+			}
+		}
+	}
+
+	var graphImpact map[string]any
+	if len(selectedIDs) > 0 && s.Query.Driver != nil {
+		graphImpact, err = s.Query.SymbolImpact(ctx, selectedIDs, graph.Options{
+			Limit:         intArg(args, "limit", 40),
+			MinConfidence: floatArg(args, "minConfidence", 0.6),
+		})
+		if err != nil {
+			graphImpact = map[string]any{"graphError": err.Error()}
+		}
+	}
+
 	impact, err := analyzeFunctionImpact(s.Repo, symbol, functionImpactOptions{
 		IncludeTests:    includeTests,
 		IncludeDocs:     boolArg(args, "includeDocs", false),
@@ -501,25 +627,78 @@ func (s Server) analyzeFunctionImpact(ctx context.Context, symbol string, args m
 		IncludeSnippets: includeSnippets,
 		MatchesPerFile:  intArg(args, "matchesPerFile", 3),
 		Limit:           intArg(args, "limit", 40),
+		PathPrefix:      pathPrefix,
+		Package:         packageFilter,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	merged, hybridMeta := mergeHybridImpact(impact, graphImpact)
+	impact = merged
+
+	stale := false
+	graphReliable := false
+	if freshness, ferr := s.indexFreshness(ctx); ferr == nil {
+		if v, ok := freshness["stale"].(bool); ok {
+			stale = v
+		}
+		if v, ok := freshness["graphReliable"].(bool); ok {
+			graphReliable = v
+		}
+	}
+	method := firstAnyString(hybridMeta, "resolutionMethod")
+	if method == "" {
+		method = "text"
+	}
+	hasCallGraph, _ := hybridMeta["hasCallGraph"].(bool)
+	confidence := impactConfidence(method, hasCallGraph, needsDisambiguation, stale, impact.UniqueFiles)
+
 	defs, defTrunc := limitSlice(compactFunctionMatches(impact.Definitions), listLimit)
 	imports, importTrunc := limitSlice(compactFunctionMatches(impact.Imports), listLimit)
 	calls, callTrunc := limitSlice(compactFunctionMatches(impact.CallSites), listLimit)
 	refs, refTrunc := limitSlice(compactFunctionMatches(impact.References), min(listLimit, 10))
 	truncated := impact.Truncated || defTrunc || importTrunc || callTrunc || refTrunc
+	if gtrunc, ok := graphImpact["truncated"].(bool); ok && gtrunc {
+		truncated = true
+	}
 
 	response := map[string]any{
-		"symbol":      symbol,
-		"uniqueFiles": impact.UniqueFiles,
-		"totalHits":   impact.TotalHits,
-		"counts":      impact.Counts,
-		"definitions": defs,
-		"callSites":   calls,
-		"truncated":   truncated,
-		"detail":      detail,
+		"symbol":               symbol,
+		"uniqueFiles":          impact.UniqueFiles,
+		"totalHits":            impact.TotalHits,
+		"counts":               impact.Counts,
+		"definitions":          defs,
+		"callSites":            calls,
+		"truncated":            truncated,
+		"detail":               detail,
+		"resolutionMethod":     method,
+		"confidence":           confidence,
+		"needsDisambiguation":  needsDisambiguation,
+		"graphReliable":        graphReliable,
+		"stale":                stale,
+		"hasCallGraph":         hasCallGraph,
+		"graphCallSites":       hybridMeta["graphCallSites"],
+		"textOnlyFiles":        hybridMeta["textOnlyFiles"],
+		"graphOnlyFiles":       hybridMeta["graphOnlyFiles"],
+	}
+	if pathPrefix != "" {
+		response["pathPrefix"] = pathPrefix
+	}
+	if packageFilter != "" {
+		response["package"] = packageFilter
+	}
+	if selected, ok := resolved["selected"].(map[string]any); ok {
+		response["resolvedSymbol"] = selected
+	}
+	if needsDisambiguation || detail != "summary" {
+		candidates := mapSlice(resolved["candidates"])
+		if len(candidates) > 0 {
+			response["candidates"], _ = limitSlice(candidates, min(listLimit, 12))
+		}
+	}
+	if needsDisambiguation {
+		response["next"] = "Multiple symbols match. Rerun with package, pathPrefix, or symbolId from candidates."
 	}
 	if detail == "summary" {
 		response["importFiles"] = len(impact.Imports)
@@ -539,7 +718,7 @@ func (s Server) analyzeFunctionImpact(ctx context.Context, symbol string, args m
 	}
 	if boolArg(args, "includeGraph", false) {
 		graphPaths := pathsForFunctionGraph(impact)
-		if len(graphPaths) > 0 {
+		if len(graphPaths) > 0 && s.Query.Driver != nil {
 			graphSummary, err := s.Query.FileRelationSummary(ctx, graphPaths, intArg(args, "relationExamples", 3))
 			if err != nil {
 				return nil, err
@@ -599,6 +778,11 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 	if detail == "summary" {
 		limit = min(limit, 12)
 	}
+	pathPrefix := firstStringArg(args, "pathPrefix", "prefix")
+	packageFilter := firstStringArg(args, "package", "pkg")
+	if packageFilter == "" {
+		packageFilter = firstStringArg(args, "packageId", "pkgId")
+	}
 	graphMatches := map[string]any{"nodes": []map[string]any{}}
 	var err error
 	if query != "" {
@@ -621,17 +805,17 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 		IncludeSnippets:  false,
 		Limit:            limit,
 		CandidateTimeout: 2 * time.Second,
+		PathPrefix:       pathPrefix,
+		Package:          packageFilter,
 	})
 	if err != nil {
 		return nil, err
 	}
-	index := map[string]any{"repo": s.Repo, "ripple": s.Query.Ripple}
-	if s.Query.Driver != nil {
-		if freshness, freshErr := s.indexFreshness(ctx); freshErr == nil {
-			index = slimIndex(freshness)
-		} else {
-			index["graphError"] = freshErr.Error()
-		}
+	index := map[string]any{"repo": s.Repo, "ripple": s.Query.Ripple, "graphReliable": false}
+	if freshness, freshErr := s.indexFreshness(ctx); freshErr == nil {
+		index = slimIndex(freshness)
+	} else if s.Query.Driver != nil {
+		index["graphError"] = freshErr.Error()
 	}
 	symbol := firstStringArg(args, "symbol", "name")
 	if symbol == "" && isIdentifier(query) {
@@ -641,17 +825,51 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 	directChangeFiles := []map[string]any{}
 	tests := relatedTests(sourceMatches.Files)
 	var impact functionImpactResult
+	var impactMeta map[string]any
 	var transitive []map[string]any
 	if symbol != "" {
-		impact, err = analyzeFunctionImpact(s.Repo, symbol, functionImpactOptions{
-			IncludeTests:   true,
-			IncludeScripts: true,
-			Limit:          intArg(args, "impactLimit", 40),
-		})
-		if err != nil {
-			return nil, err
+		// Reuse hybrid analyze path for consistent resolutionMethod/confidence.
+		impactArgs := map[string]any{
+			"symbol":        symbol,
+			"detail":        "files",
+			"includeTests":  true,
+			"includeScripts": true,
+			"limit":         intArg(args, "impactLimit", 40),
 		}
-		// Transitive off by default for token/cost control.
+		if pathPrefix != "" {
+			impactArgs["pathPrefix"] = pathPrefix
+		}
+		if packageFilter != "" {
+			impactArgs["package"] = packageFilter
+		}
+		if sid := firstStringArg(args, "symbolId", "id"); sid != "" {
+			impactArgs["symbolId"] = sid
+		}
+		impactResponse, ierr := s.analyzeFunctionImpact(ctx, symbol, impactArgs)
+		if ierr != nil {
+			return nil, ierr
+		}
+		impactMeta = impactResponse
+		// Rebuild functionImpactResult-shaped fields from hybrid response for entry/test helpers.
+		impact = functionImpactResult{
+			Symbol:      symbol,
+			UniqueFiles: intValue(impactResponse["uniqueFiles"]),
+			TotalHits:   intValue(impactResponse["totalHits"]),
+			Truncated:   boolFromAny(impactResponse["truncated"]),
+		}
+		if counts, ok := impactResponse["counts"].(map[string]int); ok {
+			impact.Counts = counts
+		} else if counts, ok := impactResponse["counts"].(map[string]any); ok {
+			impact.Counts = map[string]int{}
+			for k, v := range counts {
+				impact.Counts[k] = intValue(v)
+			}
+		}
+		impact.Definitions = functionMatchesFromCompact(mapSlice(impactResponse["definitions"]))
+		impact.CallSites = functionMatchesFromCompact(mapSlice(impactResponse["callSites"]))
+		impact.Imports = functionMatchesFromCompact(mapSlice(impactResponse["imports"]))
+		impact.References = functionMatchesFromCompact(mapSlice(impactResponse["references"]))
+
 		transitiveDepth := intArg(args, "transitiveDepth", 0)
 		if transitiveDepth > 0 {
 			transitive = s.transitiveFunctionImpact(symbol, impact, min(transitiveDepth, 1), min(intArg(args, "maxTransitiveSymbols", 4), 4), true, true, false)
@@ -677,8 +895,20 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 		"suggestedFollowUpReads":     reads,
 		"next":                       "Plan from this pack. Open only suggestedFollowUpReads when implementing. Use analyze_function_impact detail=files for fuller blast radius.",
 	}
+	if pathPrefix != "" {
+		response["pathPrefix"] = pathPrefix
+	}
+	if packageFilter != "" {
+		response["package"] = packageFilter
+	}
+	if graphReliable, ok := index["graphReliable"].(bool); ok {
+		response["graphReliable"] = graphReliable
+	}
+	if stale, ok := index["stale"].(bool); ok {
+		response["stale"] = stale
+	}
 	if symbol != "" {
-		response["impactSummary"] = map[string]any{
+		summary := map[string]any{
 			"symbol":              impact.Symbol,
 			"uniqueFiles":         impact.UniqueFiles,
 			"totalHits":           impact.TotalHits,
@@ -687,6 +917,21 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 			"referenceOnlyFiles":  len(impact.References),
 			"truncated":           impact.Truncated,
 		}
+		if impactMeta != nil {
+			for _, key := range []string{"resolutionMethod", "confidence", "needsDisambiguation", "hasCallGraph", "graphCallSites", "textOnlyFiles"} {
+				if value, ok := impactMeta[key]; ok {
+					summary[key] = value
+				}
+			}
+			if needs, _ := impactMeta["needsDisambiguation"].(bool); needs {
+				response["needsDisambiguation"] = true
+				response["next"] = "Multiple symbols match. Call resolve_symbol or rerun with package/pathPrefix/symbolId before editing."
+				if cands := mapSlice(impactMeta["candidates"]); len(cands) > 0 {
+					response["candidates"], _ = limitSlice(cands, 8)
+				}
+			}
+		}
+		response["impactSummary"] = summary
 		if detail != "summary" {
 			response["blastRadius"] = map[string]any{
 				"directCallSites": summarizeFunctionMatches(impact.CallSites, 12),
@@ -717,9 +962,46 @@ func (s Server) prepareFeatureContext(ctx context.Context, query string, args ma
 	return response, nil
 }
 
+func functionMatchesFromCompact(items []map[string]any) []functionFileMatch {
+	out := make([]functionFileMatch, 0, len(items))
+	for _, item := range items {
+		path := firstAnyString(item, "path")
+		if path == "" {
+			continue
+		}
+		match := functionFileMatch{
+			Path:     path,
+			Category: firstAnyString(item, "category"),
+			HitCount: intValue(item["hitCount"]),
+		}
+		if match.Category == "" {
+			match.Category = classifyPath(path)
+		}
+		if match.HitCount == 0 {
+			match.HitCount = 1
+		}
+		if owners := stringSlice(item["owners"]); len(owners) > 0 {
+			match.Owners = owners
+		}
+		out = append(out, match)
+	}
+	return out
+}
+
+func boolFromAny(value any) bool {
+	if v, ok := value.(bool); ok {
+		return v
+	}
+	return false
+}
+
 func slimIndex(index map[string]any) map[string]any {
 	out := map[string]any{}
-	for _, key := range []string{"ripple", "repo", "language", "analysisMode", "nodes", "relationships", "localHead", "localBranch", "updatedAt"} {
+	for _, key := range []string{
+		"ripple", "repo", "language", "analysisMode", "nodes", "relationships",
+		"localHead", "localBranch", "updatedAt", "dirtyFileCount", "graphReliable",
+		"stale", "symbolRelationCount", "callRelationCount", "recommendedAction",
+	} {
 		if value, ok := index[key]; ok && value != nil {
 			out[key] = value
 		}
@@ -1186,90 +1468,143 @@ func gitOutput(repo string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
+func gitDirtyFiles(repo string) []string {
+	if repo == "" {
+		return nil
+	}
+	cmd := exec.Command("git", "status", "--porcelain", "--untracked-files=normal")
+	cmd.Dir = repo
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	files := []string{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// porcelain: XY PATH or XY ORIG -> PATH
+		path := line
+		if len(line) >= 3 {
+			path = strings.TrimSpace(line[2:])
+		}
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+4:]
+		}
+		path = strings.Trim(path, "\"")
+		if path != "" {
+			files = append(files, filepath.ToSlash(path))
+		}
+	}
+	return files
+}
+
 func errorResponse(id any, code int, message string) map[string]any {
 	return map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": code, "message": message}}
 }
 
 func tools() []map[string]any {
 	detailSchema := stringSchema("Response detail: summary (default, cheapest), files, lines, or raw. Prefer summary for planning.")
+	// Advertised surface is intentionally small. Hidden handlers still accept:
+	// get_ripple_info, list_node_types, get_dependencies, get_dependents, find_paths,
+	// get_impact, get_route_impact, get_related_tests, search_literal.
 	return []map[string]any{
-		tool("codegraph_help", "Short router for CodeGraph tools. Use only when tool choice is unclear; prefer calling a task tool directly.", map[string]any{}, []string{}),
-		tool("get_ripple_info", "Return metadata and graph counts for the current ripple.", map[string]any{}, []string{}),
-		tool("get_index_freshness", "Return ripple metadata, analysisMode, and local git HEAD/branch when available.", map[string]any{}, []string{}),
-		tool("list_node_types", "Return node label counts and relationship type counts for the current ripple.", map[string]any{}, []string{}),
-		tool("prepare_feature_context", "One-call planning pack: entry points, likely edit files, tests, and compact blast radius. Default detail=summary is enough for planning; open files only when implementing.", map[string]any{
-			"query":   stringSchema("Feature term, symbol, path, or exact text. Aliases: q, feature, symbol, name, path."),
-			"symbol":  stringSchema("Optional function/hook/component name when known."),
-			"detail":  detailSchema,
-			"limit":   intSchema("Max source/graph matches. Default 12."),
-			"maxItems": intSchema("Max list items returned. Default 20."),
+		tool("codegraph_help", "Agent workflow + tool router. Call once if tool choice is unclear; initialize.instructions already carry the same huge-change workflow.", map[string]any{}, []string{}),
+		tool("get_index_freshness", "Step 1 of huge-change workflow: dirty tree, relation counts, graphReliable/stale. Reindex when graph is required and flags are bad.", map[string]any{}, []string{}),
+		tool("prepare_feature_context", "Single feature/symbol planning pack. For multi-file refactors use prepare_change_plan instead.", map[string]any{
+			"query":      stringSchema("Feature term, symbol, path, or exact text."),
+			"symbol":     stringSchema("Optional symbol when known."),
+			"package":    stringSchema("Optional monorepo package scope."),
+			"pathPrefix": stringSchema("Optional path prefix scope."),
+			"detail":     detailSchema,
+			"limit":      intSchema("Max matches. Default 12."),
 		}, []string{"query"}),
-		tool("analyze_function_impact", "Blast radius for a function, hook, component, method, or exported symbol: definitions, call sites, imports. Default detail=summary. Set transitiveDepth>0 only for owner expansion.", map[string]any{
-			"symbol":          stringSchema("Symbol name. Aliases: name, query, q."),
-			"detail":          detailSchema,
-			"includeTests":    boolSchema("Include tests. Default true."),
-			"includeScripts":  boolSchema("Include scripts/. Default true."),
-			"includeGraph":    boolSchema("Include Neo4j file relation summary. Default false."),
-			"transitiveDepth": intSchema("Owner expansion depth. Default 0 (off)."),
-			"limit":           intSchema("Max files scanned. Default 40."),
-			"maxItems":        intSchema("Max list items returned. Default 20."),
+		tool("prepare_change_plan", "Primary tool for huge changes: multi-target plan from symbols[] and/or paths[] (or useDirty). Returns mustEdit, mustVerify, suggestedOrder, openNext. If needsDisambiguation, call resolve_symbol then rerun.", map[string]any{
+			"symbols":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Symbol names to plan around."},
+			"paths":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Seed file paths (edited or targeted)."},
+			"query":      stringSchema("Optional free-text; identifier queries become symbols."),
+			"useDirty":   boolSchema("Include git dirty files as seed paths. Default false."),
+			"package":    stringSchema("Optional package scope."),
+			"pathPrefix": stringSchema("Optional path prefix scope."),
+			"detail":     detailSchema,
+			"maxItems":   intSchema("Max list items. Default 20."),
+		}, []string{}),
+		tool("resolve_symbol", "When needsDisambiguation=true: rank symbol candidates; pass package/pathPrefix/symbolId and rerun prepare_change_plan or analyze_function_impact.", map[string]any{
+			"name":       stringSchema("Symbol name."),
+			"package":    stringSchema("Package name or packageId filter."),
+			"packageId":  stringSchema("Exact packageId filter."),
+			"pathPrefix": stringSchema("File path prefix filter."),
+			"symbolId":   stringSchema("Exact symbol id when known."),
+			"limit":      intSchema("Max candidates. Default 20."),
+		}, []string{"name"}),
+		tool("analyze_function_impact", "Hybrid blast radius for one symbol (graph CALLS/IMPORTS + text residual). Returns resolutionMethod, confidence, needsDisambiguation.", map[string]any{
+			"symbol":     stringSchema("Symbol name."),
+			"symbolId":   stringSchema("Exact symbol id from resolve_symbol."),
+			"package":    stringSchema("Package scope."),
+			"pathPrefix": stringSchema("Path prefix scope."),
+			"detail":     detailSchema,
+			"limit":      intSchema("Max files. Default 40."),
 		}, []string{"symbol"}),
-		tool("analyze_rename_impact", "Rename/migration impact for an exact name (env, literal, path, package). Groups runtime/config/tests/docs/scripts.", map[string]any{
-			"oldName":      stringSchema("Old name or exact literal. Aliases: query, q."),
-			"kind":         stringSchema("env, literal, symbol, path, or package. Default literal."),
-			"detail":       detailSchema,
-			"includeGraph": boolSchema("Include Neo4j relation summary. Default false."),
-			"limit":        intSchema("Max files scanned. Default 40."),
-			"maxItems":     intSchema("Max items per bucket. Default 20."),
+		tool("analyze_path_set_impact", "After edits: blast radius for paths[] or useDirty=true (graph file deps + text importers/tests). Prefer before reindex when text residual is enough.", map[string]any{
+			"paths":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Seed file paths."},
+			"useDirty": boolSchema("Use git dirty files as seeds. Default false."),
+			"detail":   detailSchema,
+			"limit":    intSchema("Max dependents. Default 40."),
+		}, []string{}),
+		tool("analyze_rename_impact", "Rename/migration impact grouped by runtime/config/tests/docs/scripts.", map[string]any{
+			"oldName": stringSchema("Old name or exact literal."),
+			"kind":    stringSchema("env, literal, symbol, path, or package. Default literal."),
+			"detail":  detailSchema,
+			"limit":   intSchema("Max files. Default 40."),
 		}, []string{"oldName"}),
-		tool("analyze_callsite_contract", "Find call sites of callee missing a required pre-call check in the same owner function.", map[string]any{
-			"callee":             stringSchema("Callee name. Aliases: function, symbol, query."),
-			"requiredBeforeCall": stringSchema("Required precheck name. Aliases: required, precheck, check."),
+		tool("analyze_callsite_contract", "Find call sites of callee missing a required pre-call check.", map[string]any{
+			"callee":             stringSchema("Callee name."),
+			"requiredBeforeCall": stringSchema("Required precheck name."),
 			"detail":             detailSchema,
-			"includeTests":       boolSchema("Include tests. Default true."),
 			"limit":              intSchema("Max call sites scanned. Default 80."),
-			"resultLimit":        intSchema("Max call sites returned. Default 20."),
 		}, []string{"callee", "requiredBeforeCall"}),
-		tool("count_literal_files", "Count unique files containing exact text. Returns category counts and paths.", map[string]any{
-			"query":  stringSchema("Exact text. Aliases: q, text, term."),
-			"detail": detailSchema,
-			"limit":  intSchema("Max files. Default 40."),
-		}, []string{"query"}),
-		tool("find_env_usages", "Find runtime process.env.NAME reads. Defaults exclude tests/docs/config.", map[string]any{
-			"envName": stringSchema("Env var name. Aliases: name, query, q."),
+		tool("find_env_usages", "Find runtime process.env.NAME reads.", map[string]any{
+			"envName": stringSchema("Env var name."),
 			"detail":  detailSchema,
 			"limit":   intSchema("Max files. Default 40."),
 		}, []string{"envName"}),
-		tool("search_code", "Search indexed graph nodes (files, symbols, packages, routes). Prefer high-level tools when the task matches them.", map[string]any{
-			"query": stringSchema("Search text. Aliases: q, text, term, name, path."),
+		tool("count_literal_files", "Count unique files containing exact text.", map[string]any{
+			"query":  stringSchema("Exact text."),
+			"detail": detailSchema,
+			"limit":  intSchema("Max files. Default 40."),
+		}, []string{"query"}),
+		tool("reindex", "When graphReliable=false/stale and hybrid CALLS are needed: full ripple rebuild (not file-incremental). Long-running; then re-run prepare_change_plan. timeoutSec default 300.", map[string]any{
+			"analysisMode":  stringSchema("Optional override: fast or full."),
+			"paths":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Advisory paths of interest."},
+			"useDirty":      boolSchema("Include dirty paths as advisory. Default false."),
+			"timeoutSec":    intSchema("Timeout seconds. Default 300, max 1800."),
+			"includeImpact": boolSchema("After rebuild, summarize path impact when paths given. Default true if paths set."),
+		}, []string{}),
+		tool("search_code", "Indexed graph node search. Prefer high-level tools when the task matches them.", map[string]any{
+			"query": stringSchema("Search text."),
 			"limit": intSchema("Max results. Default 20."),
 		}, []string{"query"}),
-		tool("find_symbol", "Find symbols by name.", map[string]any{
-			"name":  stringSchema("Symbol name. Alias: query."),
+		tool("find_symbol", "Find symbols by name (advanced).", map[string]any{
+			"name":  stringSchema("Symbol name."),
 			"limit": intSchema("Max results. Default 20."),
 		}, []string{}),
-		tool("find_file", "Find files by path.", map[string]any{
-			"path":  stringSchema("File path. Alias: query."),
+		tool("find_file", "Find files by path (advanced).", map[string]any{
+			"path":  stringSchema("File path."),
 			"limit": intSchema("Max results. Default 20."),
 		}, []string{}),
-		tool("get_dependencies", "Outgoing dependencies for a node id (depth default 1, limit default 20).", nodeIDSchema(), []string{}),
-		tool("get_dependents", "Incoming dependents for a node id (depth default 1, limit default 20).", nodeIDSchema(), []string{}),
-		tool("get_relations", "Graph relations for a node id. Prefer depth=1 and limit<=20.", mapMerge(nodeIDSchema(), map[string]any{
+		tool("get_relations", "Graph relations for a known node id. Prefer depth=1 and limit<=20.", mapMerge(nodeIDSchema(), map[string]any{
 			"direction": stringSchema("forward, reverse, both, outbound, inbound."),
 			"depth":     intSchema("Traversal depth. Default 1."),
 			"limit":     intSchema("Max paths. Default 20."),
 		}), []string{}),
-		tool("find_paths", "Shortest graph path between two node ids.", map[string]any{
-			"fromId": stringSchema("Start node id. Aliases: from, sourceId."),
-			"toId":   stringSchema("End node id. Aliases: to, targetId."),
-			"depth":  intSchema("Max path depth. Default 1."),
+		tool("open_symbol_body", "Open source for a symbol id after locating it.", map[string]any{
+			"symbolId":     stringSchema("Symbol id."),
+			"contextLines": intSchema("Extra lines. Default 2."),
 		}, []string{}),
-		tool("open_symbol_body", "Open source for a symbol id. Use only after locating the symbol.", map[string]any{
-			"symbolId":     stringSchema("Symbol id. Aliases: id, targetId, sourceId."),
-			"contextLines": intSchema("Extra lines around the symbol. Default 2."),
-		}, []string{}),
-		tool("open_file_excerpt", "Open a source excerpt by path. Default endLine is 40; keep ranges tight.", map[string]any{
-			"path":      stringSchema("File path. Aliases: file, filePath."),
+		tool("open_file_excerpt", "Open a tight source excerpt by path. Default endLine 40.", map[string]any{
+			"path":      stringSchema("File path."),
 			"startLine": intSchema("Start line. Default 1."),
 			"endLine":   intSchema("End line. Default 40."),
 		}, []string{}),

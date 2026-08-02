@@ -220,10 +220,11 @@ func TestHelpIsShortRouter(t *testing.T) {
 		t.Fatal("help process failed")
 	}
 	text := toolText(t, response)
-	if len(text) > 2500 {
+	// Workflow is intentional; keep help under a soft cap so it stays agent-cheap.
+	if len(text) > 4500 {
 		t.Fatalf("help too large: %d bytes\n%s", len(text), text)
 	}
-	for _, want := range []string{"router", "prepare_feature_context", "analyze_function_impact", "tokenRules"} {
+	for _, want := range []string{"router", "workflow", "prepare_change_plan", "hugeChange", "tokenRules"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
 		}
@@ -232,6 +233,32 @@ func TestHelpIsShortRouter(t *testing.T) {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("help still contains bloated section %q:\n%s", unwanted, text)
 		}
+	}
+}
+
+func TestInitializeIncludesAgentInstructions(t *testing.T) {
+	response, ok := (Server{Repo: "/tmp/repo"}).Process(t.Context(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	if !ok {
+		t.Fatal("initialize failed")
+	}
+	raw, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		`"instructions"`,
+		"prepare_change_plan",
+		"needsDisambiguation",
+		"reindex",
+		"mustEdit",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("initialize missing %s:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(text, AgentInstructions[:40]) {
+		t.Fatalf("initialize instructions do not match AgentInstructions constant")
 	}
 }
 
@@ -245,18 +272,76 @@ func TestToolsListOmitsDeadAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, unwanted := range []string{`"get_impact"`, `"get_route_impact"`, `"get_related_tests"`, `"search_literal"`} {
+	for _, unwanted := range []string{
+		`"get_impact"`, `"get_route_impact"`, `"get_related_tests"`, `"search_literal"`,
+		`"get_dependencies"`, `"get_dependents"`, `"find_paths"`, `"get_ripple_info"`, `"list_node_types"`,
+	} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("tools/list still advertises %s", unwanted)
 		}
 	}
-	for _, want := range []string{`"prepare_feature_context"`, `"analyze_function_impact"`, `"get_relations"`} {
+	for _, want := range []string{
+		`"prepare_feature_context"`, `"prepare_change_plan"`, `"analyze_function_impact"`,
+		`"analyze_path_set_impact"`, `"resolve_symbol"`, `"reindex"`, `"get_relations"`,
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("tools/list missing %s", want)
 		}
 	}
-	if len(raw) > 14000 {
+	if len(raw) > 22000 {
 		t.Fatalf("tools/list still too large: %d bytes", len(raw))
+	}
+}
+
+func TestAnalyzeFunctionImpactReportsTextResolutionWithoutNeo4j(t *testing.T) {
+	repo := t.TempDir()
+	writeTestFile(t, repo, "src/a.ts", `
+export function resolveTenantAccount() {}
+export function recordMetric() { resolveTenantAccount(); }
+`)
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"analyze_function_impact","arguments":{"symbol":"resolveTenantAccount","raw":true}}}`)
+	response, ok := (Server{Repo: repo}).Process(t.Context(), payload)
+	if !ok {
+		t.Fatal("process failed")
+	}
+	text := toolText(t, response)
+	for _, want := range []string{`"resolutionMethod"`, `"confidence"`, `"needsDisambiguation"`, `"graphReliable"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("impact JSON missing %s:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(text, `"resolutionMethod": "text"`) && !strings.Contains(text, `"resolutionMethod":"text"`) {
+		t.Fatalf("expected text resolution without neo4j:\n%s", text)
+	}
+}
+
+func TestResolveSymbolWithoutNeo4j(t *testing.T) {
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_symbol","arguments":{"name":"getSession","raw":true}}}`)
+	response, ok := (Server{Repo: t.TempDir()}).Process(t.Context(), payload)
+	if !ok {
+		t.Fatal("process failed")
+	}
+	text := toolText(t, response)
+	if !strings.Contains(text, `"graphAvailable"`) {
+		t.Fatalf("missing graphAvailable:\n%s", text)
+	}
+}
+
+func TestIndexFreshnessWithoutNeo4j(t *testing.T) {
+	repo := t.TempDir()
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_index_freshness","arguments":{"raw":true}}}`)
+	response, ok := (Server{Repo: repo}).Process(t.Context(), payload)
+	if !ok {
+		t.Fatal("process failed")
+	}
+	text := toolText(t, response)
+	for _, want := range []string{`"graphReliable"`, `"dirtyFileCount"`, `"stale"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("freshness missing %s:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(text, `"graphReliable": false`) && !strings.Contains(text, `"graphReliable":false`) {
+		t.Fatalf("expected graphReliable false without neo4j:\n%s", text)
 	}
 }
 

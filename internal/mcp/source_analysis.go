@@ -24,6 +24,8 @@ type literalSearchOptions struct {
 	MatchesPerFile   int
 	Limit            int
 	CandidateTimeout time.Duration
+	PathPrefix       string
+	Package          string
 }
 
 type literalFileMatch struct {
@@ -53,6 +55,8 @@ type functionImpactOptions struct {
 	IncludeSnippets bool
 	MatchesPerFile  int
 	Limit           int
+	PathPrefix      string
+	Package         string
 }
 
 type functionImpactResult struct {
@@ -131,6 +135,9 @@ func searchLiteralFiles(repo string, query string, opts literalSearchOptions) (l
 			return nil
 		}
 		if !isSearchableFile(rel) {
+			return nil
+		}
+		if !pathInScope(rel, opts.PathPrefix, opts.Package) {
 			return nil
 		}
 		category := classifyPath(rel)
@@ -223,6 +230,9 @@ func analyzeFunctionImpact(repo string, symbol string, opts functionImpactOption
 			return nil
 		}
 		if !isSearchableFile(rel) {
+			return nil
+		}
+		if !pathInScope(rel, opts.PathPrefix, opts.Package) {
 			return nil
 		}
 		category := classifyPath(rel)
@@ -982,4 +992,44 @@ func redactSnippet(path string, line string) string {
 		return line[:177] + "..."
 	}
 	return line
+}
+
+// pathInScope applies optional pathPrefix / package filters for monorepo-scoped searches.
+func pathInScope(rel string, pathPrefix string, packageFilter string) bool {
+	if pathPrefix != "" {
+		prefix := strings.TrimSuffix(filepath.ToSlash(pathPrefix), "/")
+		rel = filepath.ToSlash(rel)
+		if rel != prefix && !strings.HasPrefix(rel, prefix+"/") {
+			return false
+		}
+	}
+	if packageFilter != "" {
+		return pathPackageMatch(filepath.ToSlash(rel), packageFilter)
+	}
+	return true
+}
+
+func pathPackageMatch(path string, filter string) bool {
+	raw := strings.TrimSpace(filter)
+	normalized := strings.TrimPrefix(raw, "package:")
+	if normalized == "" {
+		return true
+	}
+	lowerPath := strings.ToLower(path)
+	lowerFilter := strings.ToLower(normalized)
+	if strings.Contains(lowerPath, lowerFilter) || strings.Contains(lowerPath, strings.ToLower(raw)) {
+		return true
+	}
+	leaf := normalized
+	if i := strings.LastIndex(normalized, "/"); i >= 0 {
+		leaf = normalized[i+1:]
+	}
+	if leaf == "" {
+		return false
+	}
+	ll := strings.ToLower(leaf)
+	return strings.Contains(lowerPath, "/"+ll+"/") ||
+		strings.HasPrefix(lowerPath, ll+"/") ||
+		strings.Contains(lowerPath, "packages/"+ll+"/") ||
+		strings.Contains(lowerPath, "apps/"+ll+"/")
 }
