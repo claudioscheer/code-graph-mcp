@@ -72,6 +72,43 @@ func TestFormatToolResultKeepsRawJSONWhenRequested(t *testing.T) {
 	}
 }
 
+func TestDetailArgIgnoresRawJSONFlag(t *testing.T) {
+	// raw=true must not force detail=raw (that caused sample/total confusion).
+	if got := detailArg(map[string]any{"raw": true, "detail": "summary"}); got != "summary" {
+		t.Fatalf("detailArg with raw=true detail=summary = %q, want summary", got)
+	}
+	if got := detailArg(map[string]any{"format": "json"}); got != "summary" {
+		t.Fatalf("detailArg with format=json alone = %q, want summary default", got)
+	}
+	if got := detailArg(map[string]any{"detail": "files", "raw": true}); got != "files" {
+		t.Fatalf("detailArg with detail=files raw=true = %q, want files", got)
+	}
+}
+
+func TestCompactHeaderPrefersTotalsOverSampleCap(t *testing.T) {
+	result := map[string]any{
+		"planKind":      "rename",
+		"mustEditCount": 86,
+		"totals": map[string]any{
+			"mustEditFiles":      86,
+			"directoryPathFiles": 82,
+		},
+		"mustEditSample":   []string{"a", "b", "c"},
+		"mustEditIsSample": true,
+		"scanTruncated":    false,
+	}
+	text, err := formatToolResult("prepare_rename_plan", result, map[string]any{})
+	if err != nil {
+		t.Fatalf("formatToolResult error = %v", err)
+	}
+	if !strings.Contains(text, "mustEditFiles=86") && !strings.Contains(text, "mustEditCount=86") {
+		t.Fatalf("header missing real totals:\n%s", text)
+	}
+	if strings.Contains(text, "mustEditSampleCap") {
+		t.Fatalf("header should not advertise sample cap:\n%s", text)
+	}
+}
+
 func TestFormatToolResultCompactsHighLevelSections(t *testing.T) {
 	result := map[string]any{
 		"symbol":      "resolveTenantAccount",
@@ -251,7 +288,7 @@ func TestInitializeIncludesAgentInstructions(t *testing.T) {
 		"prepare_change_plan",
 		"needsDisambiguation",
 		"reindex",
-		"mustEdit",
+		"mustEditCount",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("initialize missing %s:\n%s", want, text)
@@ -281,8 +318,9 @@ func TestToolsListOmitsDeadAliases(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		`"prepare_feature_context"`, `"prepare_change_plan"`, `"analyze_function_impact"`,
-		`"analyze_path_set_impact"`, `"resolve_symbol"`, `"reindex"`, `"get_relations"`,
+		`"prepare_feature_context"`, `"prepare_change_plan"`, `"prepare_rename_plan"`,
+		`"analyze_function_impact"`, `"analyze_path_set_impact"`, `"resolve_symbol"`,
+		`"reindex"`, `"get_relations"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("tools/list missing %s", want)

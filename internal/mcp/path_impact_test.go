@@ -101,7 +101,7 @@ func TestPrepareChangePlanWithPaths(t *testing.T) {
 		t.Fatal("process failed")
 	}
 	text := toolText(t, response)
-	for _, want := range []string{`"planKind"`, `"mustEdit"`, `"mustVerify"`, `"suggestedOrder"`} {
+	for _, want := range []string{`"planKind"`, `"mustEditCount"`, `"suggestedOrder"`, `"totals"`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %s:\n%s", want, text)
 		}

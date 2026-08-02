@@ -9,15 +9,16 @@ Policy:
 1. Prefer one high-level CodeGraph tool first for planning and blast radius.
 2. Use normal tools to read exact source, edit, run tests, and check git.
 3. Treat graph answers as incomplete when graphReliable=false, stale=true, confidence=low, or needsDisambiguation=true.
-4. Do not open whole trees from CodeGraph; use mustEdit / mustVerify / openNext / suggestedFollowUpReads.
+4. Do not open whole trees from CodeGraph; use mustEditCount/totals + openNext samples. NEVER report len(mustEditSample) as total impact.
 
 Huge / multi-file change workflow:
 1. get_index_freshness — if stale or graphReliable=false, plan to reindex after a batch of edits (or reindex first if the index is cold).
 2. prepare_change_plan with symbols[] and/or paths[] (or useDirty=true). For a single feature name, prepare_feature_context is enough.
 3. If needsDisambiguation=true → resolve_symbol with package/pathPrefix/symbolId → rerun the plan/impact tool with that pick.
-4. Edit only mustEdit in suggestedOrder. Verify mustVerify (callers/tests). Open only openNext (or suggestedFollowUpReads) when implementing.
+4. Edit using mustEditCount/totals (samples are examples only). Verify mustVerifyCount. Open only openNext when implementing.
 5. After many edits: analyze_path_set_impact with useDirty=true (or the edited paths). If you need graph CALLS again, reindex (full rebuild; long-running) then re-run prepare_change_plan / analyze_function_impact.
-6. Specialized: analyze_rename_impact, find_env_usages, analyze_callsite_contract. Scope monorepos with package or pathPrefix.
+6. App/package renames: prepare_rename_plan with path + packageName (not bare shortName). Respect mustNotTouch and decisions[] (directory-only vs +CI/Docker). Never claim complete impact while scanTruncated=true.
+7. Specialized: analyze_rename_impact (single identity), find_env_usages, analyze_callsite_contract. Scope monorepos with package or pathPrefix.
 
 Defaults stay compact (detail=summary). Raise detail only when it changes the answer. reindex is a full ripple rebuild, not file-incremental.`
 
@@ -31,7 +32,7 @@ func workflowSpec() map[string]any {
 			"Prefer one high-level CodeGraph tool first for planning and blast radius.",
 			"Use normal tools to read exact source, edit, run tests, and check git.",
 			"Treat graph answers as incomplete when graphReliable=false, stale=true, confidence=low, or needsDisambiguation=true.",
-			"Do not open whole trees; follow mustEdit / mustVerify / openNext / suggestedFollowUpReads.",
+			"Do not open whole trees; report mustEditCount/totals, not sample list lengths.",
 		},
 		"hugeChange": []map[string]any{
 			{
@@ -69,17 +70,26 @@ func workflowSpec() map[string]any {
 			},
 		},
 		"specialized": []string{
+			"prepare_rename_plan — multi-identity app/package rename (path + package + CI/Docker layers)",
 			"analyze_function_impact — one-symbol hybrid blast radius",
-			"analyze_rename_impact — rename/migration buckets",
+			"analyze_rename_impact — single oldName only; prefer prepare_rename_plan for app moves",
 			"find_env_usages — process.env.NAME runtime reads",
 			"analyze_callsite_contract — required precheck before every call",
+		},
+		"packageRename": []map[string]any{
+			{"step": 1, "tool": "prepare_rename_plan", "do": "path=apps/foo packageName=@scope/foo shortName=foo. Do not use bare shortName alone."},
+			{"step": 2, "tool": "decisions", "do": "Choose directory+package only vs full CI/Docker identity rename."},
+			{"step": 3, "tool": "normal_agent_tools", "do": "Edit mustEdit by layer; skip mustNotTouch."},
+			{"step": 4, "tool": "rg", "do": "Verify successCriteria with unbounded rg; CodeGraph list samples can still hide paths in summary."},
 		},
 		"flags": map[string]string{
 			"needsDisambiguation": "Stop broad edits; resolve_symbol then rerun with symbolId/package/pathPrefix.",
 			"graphReliable=false": "Prefer text residual; reindex if graph CALLS are required.",
 			"stale=true":          "Working tree dirty vs index; path tools still useful, graph may lag.",
 			"confidence=low":      "Do not trust completeness; raise scope filters or reindex.",
-			"truncated=true":      "Raise limit only if it changes the decision; else split the batch.",
+			"truncated=true":      "Check scanTruncated vs listTruncated. If scanTruncated, raise limit before editing.",
+			"scanTruncated=true":  "Matching-file scan hit the limit; impact is incomplete.",
+			"listTruncated=true":  "Display samples capped only; uniqueFiles/allFiles still complete when scanTruncated=false.",
 		},
 		"scope": "On monorepos always pass package or pathPrefix when the name is common.",
 	}

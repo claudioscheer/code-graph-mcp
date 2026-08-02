@@ -10,16 +10,17 @@ import (
 const defaultMaxItems = 20
 
 // detail levels control how much structure high-level tools return and how
-// aggressively the compact formatter truncates lists.
+// aggressively lists are sampled.
 //
-//	summary (default) — counts + top paths
+//	summary (default) — counts + small samples
 //	files             — fuller file lists, still hard-capped
 //	lines             — includes line matches / snippets when present
-//	raw / json        — full JSON (via format=json, raw=true, or detail=raw)
+//	raw               — maximum structure for the tool (still may sample huge lists)
+//
+// Note: raw=true / format=json only control serialization (JSON vs compact text).
+// They must NOT force detail=raw, or agents lose summary sampling rules and
+// mis-count sample arrays as totals.
 func detailArg(args map[string]any) string {
-	if wantsJSON(args) {
-		return "raw"
-	}
 	detail := strings.ToLower(firstStringArg(args, "detail", "view"))
 	switch detail {
 	case "files", "file", "lines", "line", "full", "raw", "json":
@@ -53,7 +54,9 @@ func maxItemsArg(args map[string]any, fallback int) int {
 }
 
 func formatToolResult(tool string, result any, args map[string]any) (string, error) {
-	if wantsJSON(args) || detailArg(args) == "raw" {
+	// JSON when explicitly requested. detail=raw alone stays compact unless format=json/raw=true,
+	// so agents can request deep structure as compact text without flipping serializers.
+	if wantsJSON(args) {
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return "", err
@@ -102,6 +105,8 @@ func headerKeys(values map[string]any) map[string]bool {
 		"needsDisambiguation", "graphReliable", "stale", "hasCallGraph", "dirtyFileCount",
 		"exactCount", "ambiguous", "seedCount", "dependentCount", "relatedTestCount",
 		"packageCount", "symbolCount", "seedPathCount", "success", "incremental",
+		"scanTruncated", "listTruncated", "complete", "mustEditCount", "mustNotTouchCount",
+		"identityCount", "totalMatchesApprox", "mustEditSampleCap", "mustEditIsSample",
 	} {
 		if value, ok := values[key]; ok && isScalar(value) {
 			keys[key] = true
@@ -121,12 +126,21 @@ func compactHeader(tool string, values map[string]any) string {
 	if required := firstAnyString(values, "requiredBeforeCall"); required != "" {
 		parts = append(parts, "requires="+quoteIfNeeded(required))
 	}
+	// Prefer totals map headline fields when present (rename/change plans).
+	if totals, ok := values["totals"].(map[string]any); ok {
+		for _, key := range []string{"mustEditFiles", "directoryPathFiles", "packageIdentityFiles", "mustNotTouchFiles"} {
+			if value, ok := totals[key]; ok && isScalar(value) {
+				parts = append(parts, fmt.Sprintf("%s=%v", key, value))
+			}
+		}
+	}
 	for _, key := range []string{
 		"returned", "uniqueFiles", "totalMatches", "totalHits", "runtimeReadCount",
 		"totalCallSites", "missingCallSites", "satisfiedCallSites", "unownedCallSites",
 		"resolutionMethod", "confidence", "dirtyFileCount", "exactCount",
 		"seedCount", "dependentCount", "relatedTestCount", "packageCount",
-		"symbolCount", "seedPathCount",
+		"symbolCount", "seedPathCount", "mustEditCount", "mustNotTouchCount",
+		"mustVerifyCount", "totalMatchesApprox",
 	} {
 		if value, ok := values[key]; ok {
 			if isScalar(value) {
@@ -134,7 +148,11 @@ func compactHeader(tool string, values map[string]any) string {
 			}
 		}
 	}
-	for _, key := range []string{"needsDisambiguation", "graphReliable", "stale", "hasCallGraph", "ambiguous", "truncated", "success", "incremental"} {
+	for _, key := range []string{
+		"needsDisambiguation", "graphReliable", "stale", "hasCallGraph", "ambiguous",
+		"truncated", "scanTruncated", "listTruncated", "complete", "mustEditIsSample",
+		"success", "incremental",
+	} {
 		if value, ok := values[key]; ok {
 			parts = append(parts, fmt.Sprintf("%s=%v", key, value))
 		}
@@ -291,18 +309,29 @@ func writeStringList(b *strings.Builder, name string, values []string, indent in
 	if len(values) == 0 {
 		return
 	}
+	// Sample lists: show real total in the label, print only a few examples so
+	// agents do not treat list length as impact size.
+	listMax := maxItems
+	total := len(values)
+	if strings.HasSuffix(name, "Sample") || strings.HasSuffix(name, "sample") {
+		listMax = min(maxItems, 8)
+	}
 	b.WriteString(indentString(indent))
-	b.WriteString(fmt.Sprintf("%s (%d)\n", name, len(values)))
-	shown := min(len(values), maxItems)
+	if strings.HasSuffix(name, "Sample") || strings.HasSuffix(name, "sample") {
+		b.WriteString(fmt.Sprintf("%s (sample %d of set; use *Count/totals for size)\n", name, total))
+	} else {
+		b.WriteString(fmt.Sprintf("%s (%d)\n", name, total))
+	}
+	shown := min(total, listMax)
 	for index := 0; index < shown; index++ {
 		b.WriteString(indentString(indent))
 		b.WriteString("- ")
 		b.WriteString(values[index])
 		b.WriteByte('\n')
 	}
-	if len(values) > maxItems {
+	if total > listMax {
 		b.WriteString(indentString(indent))
-		b.WriteString(fmt.Sprintf("... +%d more\n", len(values)-maxItems))
+		b.WriteString(fmt.Sprintf("... +%d more\n", total-listMax))
 	}
 }
 

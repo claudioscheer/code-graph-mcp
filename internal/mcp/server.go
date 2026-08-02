@@ -119,6 +119,8 @@ func (s Server) call(ctx context.Context, params toolParams) (any, error) {
 		result, err = s.findEnvUsages(firstStringArg(args, "envName", "name", "query", "q", "text", "term"), args)
 	case "analyze_rename_impact":
 		result, err = s.analyzeRenameImpact(ctx, firstStringArg(args, "oldName", "query", "q", "text", "term"), stringArgDefault(args, "kind", "literal"), args)
+	case "prepare_rename_plan":
+		result, err = s.prepareRenamePlan(ctx, args)
 	case "analyze_function_impact":
 		result, err = s.analyzeFunctionImpact(ctx, firstStringArg(args, "symbol", "name", "query", "q", "text", "term"), args)
 	case "analyze_callsite_contract":
@@ -191,10 +193,12 @@ func (s Server) help() map[string]any {
 		"router": []string{
 			"single feature/symbol plan -> prepare_feature_context",
 			"multi-file / multi-symbol change -> prepare_change_plan",
+			"app/package/directory rename -> prepare_rename_plan (path + packageName)",
 			"after edits path blast radius -> analyze_path_set_impact (useDirty)",
 			"ambiguous name -> resolve_symbol then rerun plan/impact",
 			"one-symbol callers -> analyze_function_impact",
-			"rename / env / call guards -> analyze_rename_impact | find_env_usages | analyze_callsite_contract",
+			"single literal rename only -> analyze_rename_impact",
+			"env / call guards -> find_env_usages | analyze_callsite_contract",
 			"stale graph -> reindex (full rebuild) then re-plan",
 			"freshness flags -> get_index_freshness",
 		},
@@ -206,6 +210,7 @@ func (s Server) help() map[string]any {
 			"Monorepos: pass package or pathPrefix for common names.",
 		},
 		"examples": []map[string]any{
+			{"tool": "prepare_rename_plan", "arguments": map[string]any{"path": "apps/workers", "packageName": "@howdy/workers", "shortName": "workers"}},
 			{"tool": "prepare_change_plan", "arguments": map[string]any{"symbols": []string{"getSession"}, "paths": []string{"packages/auth/src/session.ts"}}},
 			{"tool": "analyze_path_set_impact", "arguments": map[string]any{"useDirty": true}},
 			{"tool": "resolve_symbol", "arguments": map[string]any{"name": "getSession", "package": "auth"}},
@@ -495,6 +500,20 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 	if detail == "summary" {
 		perBucket = min(perBucket, 10)
 	}
+	// Rename completeness matters: default scan limit is high. path/package kinds
+	// default even higher so monorepo moves are not silently truncated at 40.
+	scanLimit := intArg(args, "limit", 0)
+	if scanLimit <= 0 {
+		switch strings.ToLower(kind) {
+		case "path", "package":
+			scanLimit = defaultRenameScanLimit
+		default:
+			scanLimit = 200
+		}
+	}
+	if scanLimit > maxRenameScanLimit {
+		scanLimit = maxRenameScanLimit
+	}
 	search, err := searchLiteralFiles(s.Repo, oldName, literalSearchOptions{
 		IncludeTests:    true,
 		IncludeDocs:     true,
@@ -505,10 +524,25 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 		IncludeLines:    includeLines,
 		IncludeSnippets: includeSnippets,
 		MatchesPerFile:  intArg(args, "matchesPerFile", 4),
-		Limit:           intArg(args, "limit", 40),
+		Limit:           scanLimit,
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Auto-expand once when scan hits the cap so agents get complete counts by default.
+	if search.Truncated && scanLimit < maxRenameScanLimit && !boolArg(args, "noAutoExpand", false) {
+		expanded := min(scanLimit*2, maxRenameScanLimit)
+		if expanded > scanLimit {
+			if expandedSearch, err := searchLiteralFiles(s.Repo, oldName, literalSearchOptions{
+				IncludeTests: true, IncludeDocs: true, IncludeConfig: true, IncludeScripts: true,
+				IncludeHidden: boolArg(args, "includeHidden", true), IncludeTmp: boolArg(args, "includeTmp", false),
+				IncludeLines: includeLines, IncludeSnippets: includeSnippets,
+				MatchesPerFile: intArg(args, "matchesPerFile", 4), Limit: expanded,
+			}); err == nil {
+				search = expandedSearch
+				scanLimit = expanded
+			}
+		}
 	}
 	filesByBucket := map[string][]map[string]any{
 		"runtimeReads": {},
@@ -520,8 +554,10 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 	}
 	bucketTotals := map[string]int{}
 	relationPaths := []string{}
-	truncated := search.Truncated
+	allFiles := make([]string, 0, len(search.Files))
+	listTruncated := false
 	for _, file := range search.Files {
+		allFiles = append(allFiles, file.Path)
 		entry := map[string]any{"path": file.Path, "matchCount": file.MatchCount}
 		if includeLines && len(file.Matches) > 0 {
 			entry["matches"] = file.Matches
@@ -531,7 +567,7 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 		if len(filesByBucket[bucket]) < perBucket {
 			filesByBucket[bucket] = append(filesByBucket[bucket], entry)
 		} else {
-			truncated = true
+			listTruncated = true
 		}
 		if bucket == "runtimeReads" || bucket == "scripts" {
 			relationPaths = append(relationPaths, file.Path)
@@ -543,6 +579,7 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 	for bucket, files := range filesByBucket {
 		filesToChange[bucket] = files
 	}
+	scanTruncated := search.Truncated
 	response := map[string]any{
 		"oldName":       oldName,
 		"kind":          kind,
@@ -551,11 +588,41 @@ func (s Server) analyzeRenameImpact(ctx context.Context, oldName string, kind st
 		"counts":        search.Counts,
 		"bucketTotals":  bucketTotals,
 		"filesToChange": filesToChange,
+		"scanLimit":     scanLimit,
+		"scanTruncated": scanTruncated,
+		"listTruncated": listTruncated,
+		"truncated":     scanTruncated || listTruncated,
 		"external":      externalRenameNotes(kind),
-		"truncated":     truncated,
 		"detail":        detail,
+		"complete":      !scanTruncated,
 	}
-	if boolArg(args, "includeGraph", false) && len(relationPaths) > 0 {
+	// Full path list for complete scans (agents need it for checklists). Cap only if enormous.
+	if !scanTruncated {
+		if detail == "summary" && len(allFiles) > 40 {
+			sample, _ := limitSlice(allFiles, 40)
+			response["allFilesSample"] = sample
+			response["allFilesCount"] = len(allFiles)
+		} else {
+			response["allFiles"] = allFiles
+		}
+	}
+	if scanTruncated {
+		rec := min(scanLimit*2, maxRenameScanLimit)
+		response["recommendedLimit"] = rec
+		response["next"] = fmt.Sprintf("Scan incomplete (hit limit=%d). Rerun with limit=%d or use prepare_rename_plan. Do not claim full impact while scanTruncated=true.", scanLimit, rec)
+		response["confidence"] = "low"
+	} else {
+		response["confidence"] = "high"
+		if listTruncated {
+			response["next"] = "All matching files scanned (see allFiles / uniqueFiles). filesToChange lists are display-capped only; raise maxItems/detail=files for more samples."
+		}
+	}
+	// Common short tokens are high false-positive risk if used as oldName alone.
+	if len(oldName) > 0 && len(oldName) <= 12 && !strings.Contains(oldName, "/") && !strings.Contains(oldName, "@") {
+		response["falsePositiveRisk"] = "medium"
+		response["falsePositiveNote"] = "Short unscoped names match unrelated APIs/docs. Prefer path/package identities via prepare_rename_plan."
+	}
+	if boolArg(args, "includeGraph", false) && len(relationPaths) > 0 && s.Query.Driver != nil {
 		relationSummary, err := s.Query.FileRelationSummary(ctx, relationPaths, intArg(args, "relationExamples", 3))
 		if err != nil {
 			return nil, err
@@ -1553,11 +1620,22 @@ func tools() []map[string]any {
 			"detail":   detailSchema,
 			"limit":    intSchema("Max dependents. Default 40."),
 		}, []string{}),
-		tool("analyze_rename_impact", "Rename/migration impact grouped by runtime/config/tests/docs/scripts.", map[string]any{
+		tool("prepare_rename_plan", "Primary tool for app/package renames. Layers path + packageName + optional CI/Docker identities. Returns mustEdit, mustNotTouch, decisions, successCriteria. Prefer over single analyze_rename_impact for monorepo moves.", map[string]any{
+			"path":                    stringSchema("Directory path identity, e.g. apps/workers."),
+			"packageName":             stringSchema("Package identity, e.g. @howdy/workers."),
+			"shortName":               stringSchema("Short app name for CI/Docker stems, e.g. workers. Inferred from path/package when omitted."),
+			"includeCiJobNames":       boolSchema("Include build-{short}/deploy-{short}/cache tags. Default true."),
+			"includeDockerImageNames": boolSchema("Include APP_DIR={short}. Default true."),
+			"includeShortNameLiteral": boolSchema("Also scan bare shortName (NOISY). Default false."),
+			"detail":                  detailSchema,
+			"limit":                   intSchema("Scan limit per identity. Default 500, max 2000."),
+			"maxItems":                intSchema("Max sample paths per list. Default 40."),
+		}, []string{}),
+		tool("analyze_rename_impact", "Single-identity rename scan (one oldName). Prefer prepare_rename_plan for app moves. Default scan limit 500 for path/package (auto-expands once if truncated). Returns scanTruncated vs listTruncated.", map[string]any{
 			"oldName": stringSchema("Old name or exact literal."),
 			"kind":    stringSchema("env, literal, symbol, path, or package. Default literal."),
 			"detail":  detailSchema,
-			"limit":   intSchema("Max files. Default 40."),
+			"limit":   intSchema("Max files to scan. path/package default 500; literal default 200."),
 		}, []string{"oldName"}),
 		tool("analyze_callsite_contract", "Find call sites of callee missing a required pre-call check.", map[string]any{
 			"callee":             stringSchema("Callee name."),

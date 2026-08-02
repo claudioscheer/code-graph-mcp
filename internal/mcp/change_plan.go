@@ -211,19 +211,21 @@ func (s Server) prepareChangePlan(ctx context.Context, args map[string]any) (map
 	confidence := rollupConfidence(confidences, needsDisambiguation, stale)
 	method := rollupMethod(methods)
 
-	mustEdit, _ = limitSlice(mustEdit, maxItems)
-	mustVerify, _ = limitSlice(mustVerify, maxItems)
+	mustEditCount := len(mustEdit)
+	mustVerifyCount := len(mustVerify)
+	mustEditSample, mustEditSampled := limitSlice(mustEdit, maxItems)
+	mustVerifySample, mustVerifySampled := limitSlice(mustVerify, maxItems)
 	suggestedOrder, _ = limitSlice(suggestedOrder, maxItems+5)
 	packages, _ = limitSlice(packages, 20)
 
 	openNext := []map[string]any{}
-	for i, path := range mustEdit {
+	for i, path := range mustEditSample {
 		if i >= 3 {
 			break
 		}
 		openNext = append(openNext, map[string]any{"path": path, "why": "must_edit"})
 	}
-	for _, path := range mustVerify {
+	for _, path := range mustVerifySample {
 		if len(openNext) >= 5 {
 			break
 		}
@@ -234,33 +236,57 @@ func (s Server) prepareChangePlan(ctx context.Context, args map[string]any) (map
 	}
 
 	response := map[string]any{
-		"planKind":              "change",
-		"symbols":               symbols,
-		"seedPaths":             paths,
-		"query":                 query,
-		"symbolCount":           len(symbols),
-		"seedPathCount":         len(paths),
-		"packages":              packages,
-		"packageCount":          len(packages),
-		"mustEdit":              mustEdit,
-		"mustVerify":            mustVerify,
-		"mustNotTouch":          mustNotTouch,
-		"suggestedOrder":        suggestedOrder,
-		"openNext":              openNext,
-		"symbolImpacts":         symbolResults,
-		"resolutionMethod":      method,
-		"confidence":            confidence,
-		"needsDisambiguation":   needsDisambiguation,
-		"graphReliable":         graphReliable,
-		"stale":                 stale,
+		"planKind":            "change",
+		"symbols":             symbols,
+		"seedPaths":           paths,
+		"query":               query,
+		"symbolCount":         len(symbols),
+		"seedPathCount":       len(paths),
+		"packages":            packages,
+		"packageCount":        len(packages),
+		"mustEditCount":       mustEditCount,
+		"mustVerifyCount":     mustVerifyCount,
+		"mustEditSample":      mustEditSample,
+		"mustVerifySample":    mustVerifySample,
+		"mustEditIsSample":    mustEditSampled,
+		"mustVerifyIsSample":  mustVerifySampled,
+		"mustNotTouch":        mustNotTouch,
+		"suggestedOrder":      suggestedOrder,
+		"openNext":            openNext,
+		"symbolImpacts":       symbolResults,
+		"resolutionMethod":    method,
+		"confidence":          confidence,
+		"needsDisambiguation": needsDisambiguation,
+		"graphReliable":       graphReliable,
+		"stale":               stale,
 		"contextCompleteForPlanning": !needsDisambiguation,
-		"detail":                detail,
+		"detail":              detail,
+		"totals": map[string]any{
+			"mustEditFiles":   mustEditCount,
+			"mustVerifyFiles": mustVerifyCount,
+		},
+		"reportUsing": []string{
+			"mustEditCount / totals.mustEditFiles — NEVER len(mustEditSample)",
+			"mustVerifyCount for verification surface",
+		},
 		"stopConditions": []string{
 			"If needsDisambiguation=true, call resolve_symbol and rerun with symbolId/package before editing.",
 			"If stale=true or graphReliable=false, prefer text residual and consider reindex.",
 			"If truncated on any child impact, split symbols/paths into smaller batches.",
+			"Do not report mustEditSample length as total impact.",
 		},
-		"next": "Edit mustEdit in suggestedOrder. Verify mustVerify (callers/tests). Do not expand into mustNotTouch without evidence.",
+		"next": "Edit mustEditCount paths (see mustEditSample for examples) in suggestedOrder. Verify mustVerify. Do not expand into mustNotTouch without evidence.",
+	}
+	// Never put a capped list on mustEdit/mustVerify when sampled — agents count the array.
+	if !mustEditSampled {
+		response["mustEdit"] = mustEditSample
+	} else {
+		response["mustEditNote"] = "SAMPLE only in mustEditSample. Total is mustEditCount / totals.mustEditFiles."
+	}
+	if !mustVerifySampled {
+		response["mustVerify"] = mustVerifySample
+	} else {
+		response["mustVerifyNote"] = "SAMPLE only in mustVerifySample. Total is mustVerifyCount."
 	}
 	if packageFilter != "" {
 		response["package"] = packageFilter

@@ -66,7 +66,9 @@ The same policy is embedded in the MCP so agents see it without reading this REA
    → re-run prepare_change_plan / analyze_function_impact
 ```
 
-Specialized (not the default path): `analyze_rename_impact`, `find_env_usages`, `analyze_callsite_contract`. On monorepos pass `package` or `pathPrefix` when names are common.
+**App/package rename workflow:** `prepare_rename_plan` with `path` + `packageName` (optional `shortName` for CI/Docker). Pick a `decisions[]` option (directory+package only vs full CI/Docker identity). Edit `mustEdit`, skip `mustNotTouch`, verify `successCriteria` with unbounded `rg`. Do not use bare short names alone (`workers`) or trust results while `scanTruncated=true`.
+
+Specialized: `analyze_rename_impact` (single identity), `find_env_usages`, `analyze_callsite_contract`. On monorepos pass `package` or `pathPrefix` when names are common.
 
 ### Why CodeGraph is good
 
@@ -256,6 +258,7 @@ Results default to **compact summary text** to keep agent token use low. Pass `d
 
 - `prepare_feature_context`: one-call planning pack for a single feature/symbol query. Prefer `prepare_change_plan` for multi-target work.
 - `prepare_change_plan`: **multi-target** plan from `symbols[]` and/or `paths[]` (or `useDirty=true`). Returns `mustEdit`, `mustVerify`, `suggestedOrder`, `openNext`, `packages`, `confidence`, `needsDisambiguation`.
+- `prepare_rename_plan`: **app/package rename** plan with layered identities (`path`, `packageName`, optional CI/Docker stems). Returns `mustEdit`, `mustNotTouch`, `decisions`, `successCriteria`. Prefer over a single `analyze_rename_impact` for monorepo moves. Never trust results while `scanTruncated=true`.
 - `resolve_symbol`: disambiguate a symbol name to ranked graph candidates (`package`, `pathPrefix`, or `symbolId`).
 - `analyze_function_impact`: **hybrid** blast radius (graph `CALLS`/`IMPORTS_SYMBOL` + filesystem text residual). Returns `resolutionMethod`, `confidence`, `needsDisambiguation`, `graphReliable`, `stale`.
 - `analyze_path_set_impact`: blast radius for a **path set** (graph file deps + text importers/tests). Supports `useDirty`.
